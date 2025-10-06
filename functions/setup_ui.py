@@ -179,18 +179,24 @@ class TrackMaskOperator(bpy.types.Operator):
 
             used_mask = self._used_mask_dir
 
-            self.guide_mask, self.bounding_box, overlay_l, _ = generate_masks.track_mask(source_image = image, 
-                                                                                         used_mask = used_mask, 
-                                                                                         predictor = predictor, 
-                                                                                         guide_mask = self.guide_mask, 
-                                                                                         guide_strength = guide_strength, 
+            self.guide_mask, self.bounding_box, overlay_l, _ = generate_masks.track_mask(source_image = image,
+                                                                                         used_mask = used_mask,
+                                                                                         predictor = predictor,
+                                                                                         guide_mask = self.guide_mask,
+                                                                                         guide_strength = guide_strength,
                                                                                          blur_radius=blur_radius,
                                                                                          search_radius = search_radius,
                                                                                          input_points = self.prompt_points,
                                                                                          input_labels = self.prompt_labels,
                                                                                          input_box = self.bounding_box,
                                                                                          input_logits = None)
-            
+
+            # Check if tracking lost the mask (bounding box is None)
+            if self.bounding_box is None:
+                self.report({'WARNING'}, f'Tracking lost at frame {self._next_processed_frame}! Stopping.')
+                self.cancel(context)
+                return {'CANCELLED'}
+
             overlay.rotoforge_overlay_shader.custom_img = overlay_l
 
             self.prompt_points = None

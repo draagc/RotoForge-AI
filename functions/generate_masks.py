@@ -283,11 +283,14 @@ def track_mask(
     best_mask, best_logits = predict_mask(pixels_uint8_rgb, predictor, guide_mask, guide_strength, input_points, input_labels, input_box, input_logits)
     
     overlay_l = save_sequential_mask(source_image, used_mask, best_mask, cropping_box, blur_radius)
-    
+
     #Set input data for next frame
     input_box = calculate_bounding_box(best_mask)
-    input_box = np.array([input_box[0] - search_radius, input_box[1] - search_radius, input_box[2] + search_radius, input_box[3] + search_radius])
-    if cropping_box is not None:
-        input_box = np.array([input_box[0] + cropping_box[0], input_box[1] + cropping_box[1], input_box[2] + cropping_box[0], input_box[3] + cropping_box[1]])
-        
+
+    # Handle case where no bounding box is found (empty mask)
+    if input_box is not None:
+        input_box = np.array([input_box[0] - search_radius, input_box[1] - search_radius, input_box[2] + search_radius, input_box[3] + search_radius])
+        if cropping_box is not None:
+            input_box = np.array([input_box[0] + cropping_box[0], input_box[1] + cropping_box[1], input_box[2] + cropping_box[0], input_box[3] + cropping_box[1]])
+
     return best_mask, input_box, overlay_l, best_logits
