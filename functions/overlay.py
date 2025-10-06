@@ -6,47 +6,56 @@ import gpu_extras.batch
 from . import mask_rasterize
 from mathutils import Matrix
 
-vert_out = gpu.types.GPUStageInterfaceInfo("my_interface")
-vert_out.smooth('VEC2', "uvInterp")
+# Global variables for shader and batch - initialized during register()
+shader = None
+batch = None
 
-shader_info = gpu.types.GPUShaderCreateInfo()
-shader_info.push_constant('MAT4', "ModelViewProjectionMatrix")
-shader_info.push_constant('VEC4', "overlayColor")
-shader_info.sampler(0, 'FLOAT_2D', "image")
-shader_info.vertex_in(0, 'VEC2', "position")
-shader_info.vertex_in(1, 'VEC2', "uv")
-shader_info.vertex_out(vert_out)
-shader_info.fragment_out(0, 'VEC4', "FragColor")
+def _create_shader():
+    """Create the overlay shader. Called during addon registration."""
+    vert_out = gpu.types.GPUStageInterfaceInfo("my_interface")
+    vert_out.smooth('VEC2', "uvInterp")
 
-shader_info.vertex_source(
-    "void main()"
-    "{"
-    "  uvInterp = uv;"
-    "  gl_Position = ModelViewProjectionMatrix * vec4(position, 0.0, 1.0);"
-    "}"
-)
+    shader_info = gpu.types.GPUShaderCreateInfo()
+    shader_info.push_constant('MAT4', "ModelViewProjectionMatrix")
+    shader_info.push_constant('VEC4', "overlayColor")
+    shader_info.sampler(0, 'FLOAT_2D', "image")
+    shader_info.vertex_in(0, 'VEC2', "position")
+    shader_info.vertex_in(1, 'VEC2', "uv")
+    shader_info.vertex_out(vert_out)
+    shader_info.fragment_out(0, 'VEC4', "FragColor")
 
-shader_info.fragment_source(
-    "void main()"
-    "{"
-    "  vec2 texelSize = 1.0 / (textureSize(image, 0));"
-    "  vec2 nearestUV = floor(uvInterp / texelSize) * texelSize + texelSize * 0.5;"
-    "  vec4 texColor = texture(image, nearestUV);"
-    "  FragColor = texColor * vec4(overlayColor.rgb, overlayColor.a * (1.0 - texColor));"
-    "}"
-)
+    shader_info.vertex_source(
+        "void main()"
+        "{"
+        "  uvInterp = uv;"
+        "  gl_Position = ModelViewProjectionMatrix * vec4(position, 0.0, 1.0);"
+        "}"
+    )
 
-shader = gpu.shader.create_from_info(shader_info)
-del vert_out
-del shader_info
+    shader_info.fragment_source(
+        "void main()"
+        "{"
+        "  ivec2 texSize = textureSize(image, 0);"
+        "  vec2 texelSize = vec2(1.0) / vec2(texSize);"
+        "  vec2 nearestUV = floor(uvInterp / texelSize) * texelSize + texelSize * 0.5;"
+        "  vec4 texColor = texture(image, nearestUV);"
+        "  FragColor = vec4(texColor.rgb * overlayColor.rgb, overlayColor.a * (1.0 - texColor.r));"
+        "}"
+    )
 
-batch = gpu_extras.batch.batch_for_shader(
-    shader, 'TRI_FAN',
-    {
-        "position": ((0, 0), (1, 0), (1, 1), (0, 1)),
-        "uv": ((0, 0), (1, 0), (1, 1), (0, 1)),
-    },
-)
+    created_shader = gpu.shader.create_from_info(shader_info)
+    del vert_out
+    del shader_info
+
+    created_batch = gpu_extras.batch.batch_for_shader(
+        created_shader, 'TRI_FAN',
+        {
+            "position": ((0, 0), (1, 0), (1, 1), (0, 1)),
+            "uv": ((0, 0), (1, 0), (1, 1), (0, 1)),
+        },
+    )
+
+    return created_shader, created_batch
 
 def rotoforge_overlay_shader():
     context = bpy.context
@@ -215,11 +224,18 @@ classes = [OverlayControls,
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
-    
-    global overlay_handler
+
+    global overlay_handler, shader, batch
     if overlay_handler is None:
-        rotoforge_overlay_shader.custom_img = None
-        overlay_handler = bpy.types.SpaceImageEditor.draw_handler_add(rotoforge_overlay_shader, (), 'WINDOW', 'POST_PIXEL')
+        try:
+            # Create shader during registration
+            shader, batch = _create_shader()
+            rotoforge_overlay_shader.custom_img = None
+            overlay_handler = bpy.types.SpaceImageEditor.draw_handler_add(rotoforge_overlay_shader, (), 'WINDOW', 'POST_PIXEL')
+        except Exception as e:
+            print(f'RotoForge AI: Warning - Could not create overlay shader: {e}')
+            print('RotoForge AI: Overlay functionality will be disabled, but the addon will continue to work')
+            # Continue without overlay - the rest of the addon can still function
 
 def unregister():
     global overlay_handler

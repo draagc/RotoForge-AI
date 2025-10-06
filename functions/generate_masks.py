@@ -8,31 +8,58 @@ from .prompt_utils import fake_logits, calculate_bounding_box
 from .data_manager import save_sequential_mask, save_singular_mask
 
 
+def get_device():
+    """Detect and return the best available device (CUDA > MPS > CPU).
+
+    Returns:
+        tuple: (device_str, device_name) e.g. ("cuda", "CUDA acceleration")
+    """
+    if torch.cuda.is_available():
+        return "cuda", "CUDA acceleration"
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        return "mps", "MPS acceleration (Apple Silicon)"
+    else:
+        return "cpu", "CPU"
+
+
+def empty_cache():
+    """Empty the memory cache for the current device."""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+
 
 def get_predictor(model_type):
     import segment_anything_hq
     from .install_dependencies import get_install_folder
     
     # Empty the memory cache before to clean up any mess that's been handed over
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    
+    empty_cache()
+
     # Debug info
     print("PyTorch version: ", torch.__version__)
-    
-    if torch.cuda.is_available():
-        print("Using CUDA accelleration")
-        device = "cuda"
-    else:
-        print("Using CPU")
-        device = "cpu"
+
+    # Device selection: CUDA > MPS > CPU
+    device, device_name = get_device()
+    print(f"Using {device_name}")
 
     # Fetch predictor
     print('loading predictor')
     sam_checkpoint = f"{get_install_folder('sam_hq_weights')}/sam_hq_{model_type}.pth"
 
-    sam = segment_anything_hq.sam_model_registry[model_type](checkpoint=sam_checkpoint)
-    sam.to(device=device)
+    # On non-CUDA systems, we need to specify map_location for torch.load
+    # Monkey-patch the checkpoint loading to handle device mapping
+    if device != "cuda":
+        # Load checkpoint with explicit device mapping
+        checkpoint_dict = torch.load(sam_checkpoint, map_location=device)
+        sam = segment_anything_hq.sam_model_registry[model_type](checkpoint=None)
+        sam.load_state_dict(checkpoint_dict)
+        sam.to(device=device)
+    else:
+        # CUDA can load normally
+        sam = segment_anything_hq.sam_model_registry[model_type](checkpoint=sam_checkpoint)
+        sam.to(device=device)
 
     predictor = segment_anything_hq.SamPredictor(sam)
 
@@ -112,8 +139,7 @@ def predict_mask(pixels_uint8_rgb, predictor, guide_mask, guide_strength, input_
         multimask_output=True,
     )
     # Empty the memory cache after using SAM because Meta forgot
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    empty_cache()
     # Initialize variables outside the loop
     best_score = float('-inf')
     cropped_area = len(pixels_uint8_rgb.flatten())/3

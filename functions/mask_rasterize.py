@@ -227,6 +227,12 @@ def rasterize_layer_of_active_mask(layer, resolution, rf_allowed = False, hide_u
     
     # Clean up: delete the new scene
     bpy.data.scenes.remove(new_scene, do_unlink=True)
+
+    # Handle case where rasterized_layer is None
+    if rasterized_layer is None:
+        # Return empty mask with correct resolution
+        return np.zeros((resolution[1], resolution[0]), dtype=np.float32) * (255 if use_255_range else 1)
+
     if use_255_range:
         return rasterized_layer*255
     else:

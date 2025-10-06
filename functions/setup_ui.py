@@ -30,10 +30,7 @@ def time_checkpoint(start, name):
 def free_predictor():
     global predictor
     predictor = None
-    from torch import cuda
-    if cuda.is_available:
-        cuda.empty_cache()
-    del cuda
+    generate_masks.empty_cache()
 
 
 
