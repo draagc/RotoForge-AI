@@ -19,12 +19,17 @@ def get_image_filepath_in_dir(dir):
 
 
 def save_sequential_mask(source_image, used_mask, best_mask, cropping_box, blur = 0.0):
-    
-    frame = str(bpy.context.scene.frame_current)
+
+    # Calculate padding based on the highest frame number in the scene
+    # This ensures proper string sorting (e.g., 0066 comes before 0100)
+    max_frame = max(bpy.context.scene.frame_end, bpy.context.scene.frame_current)
+    padding = len(str(max_frame))
+    frame = str(bpy.context.scene.frame_current).zfill(padding)
+
     width, height = source_image.size
-    
+
     # The img seq will be saved in a folder named after the mask in the RotoForge/masksequences dir
-    folder = used_mask 
+    folder = used_mask
     img_seq_dir = os.path.join(get_rotoforge_dir('masksequences'), folder)
     image_path = os.path.join(img_seq_dir, frame + '.png')
         
