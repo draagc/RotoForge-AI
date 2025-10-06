@@ -55,12 +55,17 @@ class GenerateSingularMaskOperator(bpy.types.Operator):
         layer = mask.layers.active
         image = space.image
         maskgencontrols = mask.rotoforge_maskgencontrols[layer.name]
-        
+
+        # Validate that user has drawn mask splines
+        if len(layer.splines) == 0:
+            self.report({'ERROR'}, 'No mask splines found! Please draw a mask first.')
+            return {'CANCELLED'}
+
         #Wake AI if not present
         global predictor
         global used_model
-        
-        
+
+
         if predictor == None or used_model != maskgencontrols.used_model:
             # Start the timer
             fetching = process_time()
@@ -70,13 +75,18 @@ class GenerateSingularMaskOperator(bpy.types.Operator):
         
         # Start the timer
         start = process_time()
-        
+
         #Get Prompt data to feed the machine god
         resolution = tuple(image.size)
         guide_mask = mask_rasterize.rasterize_layer_of_active_mask(layer, resolution)
         prompt_points, prompt_labels = prompt_utils.extract_prompt_points(mask, resolution)
         bounding_box = prompt_utils.calculate_bounding_box(guide_mask)
-        
+
+        # check if we got any usable input
+        if bounding_box is None and prompt_points is None:
+            self.report({'ERROR'}, 'No valid mask input! The mask appears to be empty or invisible.')
+            return {'CANCELLED'}
+
         guide_strength = maskgencontrols.guide_strength
         blur_radius = maskgencontrols.feather_radius
         
@@ -232,6 +242,11 @@ class TrackMaskOperator(bpy.types.Operator):
             image = space.image
             maskgencontrols = mask.rotoforge_maskgencontrols[layer.name]
 
+            # Validate that user has drawn mask splines
+            if len(layer.splines) == 0:
+                self.report({'ERROR'}, 'No mask splines found! Please draw a mask first.')
+                return {'CANCELLED'}
+
             #Wake AI if not present
             global predictor
             global used_model
@@ -246,7 +261,12 @@ class TrackMaskOperator(bpy.types.Operator):
             self.prompt_points, self.prompt_labels = prompt_utils.extract_prompt_points(mask, resolution)
             self.bounding_box = prompt_utils.calculate_bounding_box(self.guide_mask)
 
-            
+            # check if we got any usable input
+            if self.bounding_box is None and self.prompt_points is None:
+                self.report({'ERROR'}, 'No valid mask input! The mask appears to be empty or invisible.')
+                return {'CANCELLED'}
+
+
             # Get the folder to write to
             used_mask = f"{mask.name}/MaskLayers/{layer.name}"
             self._used_mask_dir = used_mask
