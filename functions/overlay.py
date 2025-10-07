@@ -10,6 +10,69 @@ from mathutils import Matrix
 shader = None
 batch = None
 
+# Cache for overlay to avoid expensive rasterization on every draw
+_overlay_cache = {
+    'mask_name': None,
+    'layer_name': None,
+    'frame': None,
+    'pixels': None,
+    'resolution': None
+}
+
+def invalidate_overlay_cache():
+    """Clear the overlay cache. Call this when mask data changes."""
+    global _overlay_cache
+    _overlay_cache['mask_name'] = None
+    _overlay_cache['layer_name'] = None
+    _overlay_cache['frame'] = None
+    _overlay_cache['pixels'] = None
+    _overlay_cache['resolution'] = None
+
+def get_cached_or_rasterize(mask, only_active_layer, current_frame, resolution):
+    """Get rasterized pixels from cache or rasterize if cache is invalid.
+
+    Args:
+        mask: The active mask object
+        only_active_layer: Whether to rasterize only active layer or all layers
+        current_frame: Current scene frame number
+        resolution: Tuple of (width, height)
+
+    Returns:
+        Numpy array of rasterized mask pixels
+    """
+    global _overlay_cache
+
+    cache_key = (mask.name, mask.layers.active.name if only_active_layer else 'all', current_frame, resolution)
+
+    # Check if cache is valid
+    if (_overlay_cache['mask_name'] == cache_key[0] and
+        _overlay_cache['layer_name'] == cache_key[1] and
+        _overlay_cache['frame'] == cache_key[2] and
+        _overlay_cache['resolution'] == cache_key[3] and
+        _overlay_cache['pixels'] is not None):
+        return _overlay_cache['pixels']
+
+    # Cache miss - rasterize and update cache
+    if only_active_layer:
+        pixels = mask_rasterize.rasterize_layer_of_active_mask(
+            mask.layers.active,
+            resolution=resolution,
+            rf_allowed=True,
+            hide_uncyclic=False,
+            use_255_range=True
+        )
+    else:
+        pixels = mask_rasterize.rasterize_active_mask()
+
+    # Update cache
+    _overlay_cache['mask_name'] = cache_key[0]
+    _overlay_cache['layer_name'] = cache_key[1]
+    _overlay_cache['frame'] = cache_key[2]
+    _overlay_cache['resolution'] = cache_key[3]
+    _overlay_cache['pixels'] = pixels
+
+    return pixels
+
 def _create_shader():
     """Create the overlay shader. Called during addon registration."""
     vert_out = gpu.types.GPUStageInterfaceInfo("my_interface")
@@ -103,12 +166,12 @@ def rotoforge_overlay_shader():
             if len_pixels >= 1:
                 source_pixels_rgba = np.zeros(len_pixels, dtype=np.float32)
                 image.pixels.foreach_get(source_pixels_rgba)
-                
+
         if source_pixels_rgba is None:
-            if only_active_layer:
-                source_pixels = mask_rasterize.rasterize_layer_of_active_mask(mask.layers.active, resolution=space.image.size, rf_allowed=True, hide_uncyclic=False, use_255_range=True)
-            else:
-                source_pixels = mask_rasterize.rasterize_active_mask()
+            # Get pixels from cache or rasterize if needed
+            current_frame = context.scene.frame_current
+            current_resolution = tuple(space.image.size)
+            source_pixels = get_cached_or_rasterize(mask, only_active_layer, current_frame, current_resolution)
     
     if source_pixels_rgba is None:
         source_pixels = source_pixels.flatten()/255

@@ -103,9 +103,12 @@ class GenerateSingularMaskOperator(bpy.types.Operator):
                                      input_box = bounding_box,
                                      debug_logits = False)
         data_manager.update_maskseq(used_mask)
-        
+
+        # Invalidate overlay cache since we generated a new mask
+        overlay.invalidate_overlay_cache()
+
         self.report({'INFO'}, f'Saved mask layer as image: {used_mask}')
-        
+
         time_checkpoint(start, 'Mask generation')
         return {'FINISHED'}
     
@@ -287,10 +290,14 @@ class TrackMaskOperator(bpy.types.Operator):
         
         overlay.rotoforge_overlay_shader.custom_img = None
         data_manager.update_maskseq(self._used_mask_dir)
+
+        # Invalidate overlay cache since we generated new masks
+        overlay.invalidate_overlay_cache()
+
         overlaycontrols = context.scene.rotoforge_overlaycontrols
         overlaycontrols.used_mask = self._used_mask_dir
-        
-        
+
+
         # Stop on the last done frame
         context.scene.frame_current = self._next_processed_frame
 
@@ -298,7 +305,7 @@ class TrackMaskOperator(bpy.types.Operator):
         self.guide_mask = None
         self.prompt_points, self.prompt_labels = None, None
         self.bounding_box = None
-        
+
         self.report({'INFO'}, f'Saved mask layer as image sequence: {self._used_mask_dir}')
         print("Quitting...")
         
@@ -383,17 +390,21 @@ class MergeMaskOperator(bpy.types.Operator):
         
         overlay.rotoforge_overlay_shader.custom_img = None
         data_manager.update_maskseq(self._used_mask_dir)
+
+        # Invalidate overlay cache since we generated new masks
+        overlay.invalidate_overlay_cache()
+
         overlaycontrols = context.scene.rotoforge_overlaycontrols
         overlaycontrols.used_mask = self._used_mask_dir
-        
-        
+
+
         # Stop on the last done frame
         context.scene.frame_current = self._next_processed_frame
-        
+
         # Release prompt data
         self.resolution = None
         self.tracking = None
-        
+
         self.report({'INFO'}, f'Saved combined mask as image sequence: {self._used_mask_dir}')
         print("Quitting...")
 
