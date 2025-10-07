@@ -420,7 +420,8 @@ class ImportMaskNodeOperator(bpy.types.Operator):
     
     @classmethod
     def poll(self, context):
-        if context.space_data.node_tree is None or context.scene.rotoforge_importcontrols.used_mask == '':
+        used_mask = context.scene.rotoforge_importcontrols.used_mask
+        if context.space_data.node_tree is None or used_mask in ('', 'NONE'):
             return False
         return True
 
@@ -681,6 +682,11 @@ class NodeImportControls(bpy.types.PropertyGroup):
             image_name = f"{mask.name}/Combined"
             if image_name in bpy.data.images:
                 possible_mask.append(mask.name)
+
+        # Return placeholder if no masks are available to avoid enum warning
+        if len(possible_mask) < 1:
+            return [('NONE', 'No baked masks available', 'Please bake a mask first using "Bake Mask to Texture"')]
+
         return [(element, element, f'Import the mask "{element}"') for element in possible_mask]
     
     used_mask : bpy.props.EnumProperty(
