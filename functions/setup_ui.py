@@ -1,4 +1,5 @@
 import bpy
+import os
 
 from time import process_time
 
@@ -9,7 +10,7 @@ from . import overlay
 from . import mask_rasterize
 from . import data_manager
 
-predictor = None
+processor = None
 used_model = None
 
 
@@ -28,8 +29,8 @@ def time_checkpoint(start, name):
 
 
 def free_predictor():
-    global predictor
-    predictor = None
+    global processor
+    processor = None
     generate_masks.empty_cache()
 
 
@@ -62,16 +63,15 @@ class GenerateSingularMaskOperator(bpy.types.Operator):
             return {'CANCELLED'}
 
         #Wake AI if not present
-        global predictor
+        global processor
         global used_model
 
-
-        if predictor == None or used_model != maskgencontrols.used_model:
+        if processor == None or used_model != maskgencontrols.used_model:
             # Start the timer
             fetching = process_time()
             used_model = maskgencontrols.used_model
-            predictor = generate_masks.get_predictor(model_type=used_model)
-            time_checkpoint(fetching, 'Predictor fetching')
+            processor = generate_masks.get_predictor()
+            time_checkpoint(fetching, 'Processor fetching')
         
         # Start the timer
         start = process_time()
@@ -94,7 +94,7 @@ class GenerateSingularMaskOperator(bpy.types.Operator):
         
         generate_masks.generate_mask(source_image = image, 
                                      used_mask = used_mask, 
-                                     predictor = predictor, 
+                                     processor = processor, 
                                      guide_mask = guide_mask, 
                                      guide_strength = guide_strength,
                                      blur_radius= blur_radius,
@@ -125,26 +125,26 @@ class TrackMaskOperator(bpy.types.Operator):
     bl_idname = "rotoforge.track_mask"
     bl_label = "Track Mask"
     bl_options = {'REGISTER', 'UNDO'}
-    
-    
+
+
     _timer = None
     _next_processed_frame = None
     _used_mask_dir = None
     _running = False
-    
+
     #Prompt data for the machine god
     guide_mask = None
     prompt_points, prompt_labels = None, None
     bounding_box = None
-    
-    
+
+
     backwards: bpy.props.BoolProperty(
         name="Backwards",
         description="Tracks backwards",
         default=False
     ) # type: ignore
-    
-    
+
+
     @classmethod
     def poll(self, context):
         if context.space_data.image is None:
@@ -152,20 +152,20 @@ class TrackMaskOperator(bpy.types.Operator):
         if context.space_data.image.source not in ['SEQUENCE', 'MOVIE']:
             return False
         return True
-    
+
     def modal(self, context, event):
         if event.type == 'TIMER':
-            
+
             space = context.space_data
             mask = space.mask
             layer = mask.layers.active
             image = space.image
             maskgencontrols = mask.rotoforge_maskgencontrols[layer.name]
-            
+
             # Apply frame
-            context.scene.frame_current = self._next_processed_frame 
+            context.scene.frame_current = self._next_processed_frame
             space.image_user.frame_current = self._next_processed_frame
-            
+
             # Force-update the viewport for internal use
             space.display_channels = space.display_channels
 
@@ -175,7 +175,7 @@ class TrackMaskOperator(bpy.types.Operator):
 
 
             #Wake AI if not present
-            global predictor
+            global processor
             global used_model
 
             if not maskgencontrols.tracking and self.prompt_points is None: # Run if tracking is disabled and it's not the 1st frame
@@ -185,7 +185,7 @@ class TrackMaskOperator(bpy.types.Operator):
                 self.prompt_points, self.prompt_labels = prompt_utils.extract_prompt_points(mask, resolution)
                 self.bounding_box = prompt_utils.calculate_bounding_box(self.guide_mask)
 
-            
+
             guide_strength = maskgencontrols.guide_strength
             search_radius = maskgencontrols.search_radius
             blur_radius = maskgencontrols.feather_radius
@@ -194,7 +194,7 @@ class TrackMaskOperator(bpy.types.Operator):
 
             self.guide_mask, self.bounding_box, overlay_l, _ = generate_masks.track_mask(source_image = image,
                                                                                          used_mask = used_mask,
-                                                                                         predictor = predictor,
+                                                                                         processor = processor,
                                                                                          guide_mask = self.guide_mask,
                                                                                          guide_strength = guide_strength,
                                                                                          blur_radius=blur_radius,
@@ -214,12 +214,12 @@ class TrackMaskOperator(bpy.types.Operator):
 
             self.prompt_points = None
             self.prompt_labels = None
-            
+
             if not self.backwards:
                 endframe = mask.frame_end
             else:
                 endframe = mask.frame_start
-            
+
             if self._next_processed_frame  == endframe:
                 self.cancel(context)
                 return{'CANCELLED'}
@@ -229,12 +229,12 @@ class TrackMaskOperator(bpy.types.Operator):
                 else:
                     self._next_processed_frame -= 1
                 return {'PASS_THROUGH'}
-        
-        
+
+
         if event.type in ['ESC', 'RIGHTMOUSE']:
             self.cancel(context)
             return {'CANCELLED'}
-        
+
         return {'PASS_THROUGH'}
 
     def execute(self, context):
@@ -251,12 +251,12 @@ class TrackMaskOperator(bpy.types.Operator):
                 return {'CANCELLED'}
 
             #Wake AI if not present
-            global predictor
+            global processor
             global used_model
 
-            if predictor == None or used_model != maskgencontrols.used_model:
+            if processor == None or used_model != maskgencontrols.used_model:
                 used_model = maskgencontrols.used_model
-                predictor = generate_masks.get_predictor(model_type=used_model)
+                processor = generate_masks.get_predictor()
 
             #Get Prompt data to feed the machine god
             resolution = tuple(image.size)
@@ -273,8 +273,8 @@ class TrackMaskOperator(bpy.types.Operator):
             # Get the folder to write to
             used_mask = f"{mask.name}/MaskLayers/{layer.name}"
             self._used_mask_dir = used_mask
-            
-            
+
+
             self._next_processed_frame = context.scene.frame_current # Set last processed frame
             self._running = True
             context.window_manager.modal_handler_add(self)
@@ -282,19 +282,55 @@ class TrackMaskOperator(bpy.types.Operator):
             return {'RUNNING_MODAL'}
         else:
             return {'CANCELLED'}
-    
+
     def cancel(self, context):
-        
+
         context.window_manager.event_timer_remove(self._timer)
         self._running = False
-        
+
         overlay.rotoforge_overlay_shader.custom_img = None
-        data_manager.update_maskseq(self._used_mask_dir)
+
+        # Disable overlay before removing image to prevent concurrent access
+        overlaycontrols = context.scene.rotoforge_overlaycontrols
+        overlay_was_active = overlaycontrols.active_overlay
+        overlaycontrols.active_overlay = False
+
+        # Force a redraw to ensure overlay handler releases the image
+        context.area.tag_redraw()
+
+        # CRITICAL FIX: Remove ALL mask images before reloading
+        # Blender's movie cache becomes corrupted when image sequences are actively written
+        # The only safe solution is to completely remove and reload all mask images
+        space = context.space_data
+        mask = space.mask
+
+        # Collect all mask image names to remove
+        mask_images_to_remove = []
+        for image in bpy.data.images:
+            if image.source == 'SEQUENCE' and f"{mask.name}/MaskLayers/" in image.name:
+                mask_images_to_remove.append(image.name)
+
+        # Remove all mask layer images
+        for img_name in mask_images_to_remove:
+            if img_name in bpy.data.images:
+                img = bpy.data.images[img_name]
+                bpy.data.images.remove(img, do_unlink=True)
+
+        # Reload all mask layer images that have directories on disk
+        # (only reload if the layer was actually tracked and has files)
+        maskseq_dir = data_manager.get_rotoforge_dir('masksequences')
+        for layer in mask.layers:
+            layer_image_name = f"{mask.name}/MaskLayers/{layer.name}"
+            layer_dir = os.path.join(maskseq_dir, layer_image_name)
+            if os.path.isdir(layer_dir):
+                data_manager.update_maskseq(layer_image_name)
+
+        # Restore overlay state
+        overlaycontrols.active_overlay = overlay_was_active
 
         # Invalidate overlay cache since we generated new masks
         overlay.invalidate_overlay_cache()
 
-        overlaycontrols = context.scene.rotoforge_overlaycontrols
         overlaycontrols.used_mask = self._used_mask_dir
 
 
@@ -384,11 +420,19 @@ class MergeMaskOperator(bpy.types.Operator):
             return {'CANCELLED'}
     
     def cancel(self, context):
-        
+
         context.window_manager.event_timer_remove(self._timer)
         self._running = False
-        
+
         overlay.rotoforge_overlay_shader.custom_img = None
+
+        # CRITICAL FIX: Remove Combined mask image before reloading
+        # Same movie cache issue as layer masks
+        if self._used_mask_dir in bpy.data.images:
+            img = bpy.data.images[self._used_mask_dir]
+            bpy.data.images.remove(img, do_unlink=True)
+
+        # Now reload with fresh cache
         data_manager.update_maskseq(self._used_mask_dir)
 
         # Invalidate overlay cache since we generated new masks

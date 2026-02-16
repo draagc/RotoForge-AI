@@ -200,14 +200,37 @@ def rotoforge_overlay_shader():
     batch.draw(shader)
 
 class OverlayControls(bpy.types.PropertyGroup):
+    def _update_active_overlay(self, context):
+        """Clear image buffers when toggling overlay to prevent cache crashes."""
+        if self.active_overlay:
+            # Free buffers for all mask images before enabling overlay
+            for image in bpy.data.images:
+                if image.source == 'SEQUENCE' and '/MaskLayers/' in image.name:
+                    if hasattr(image, 'buffers_free'):
+                        image.buffers_free()
+
+    def _update_only_active_layer(self, context):
+        """Clear Combined mask buffers when switching to combined view."""
+        if not self.only_active_layer:
+            # About to switch to Combined mask - free its buffers
+            space = context.space_data
+            if space and space.mask:
+                combined_name = f"{space.mask.name}/Combined"
+                if combined_name in bpy.data.images:
+                    img = bpy.data.images[combined_name]
+                    if hasattr(img, 'buffers_free'):
+                        img.buffers_free()
+
     active_overlay : bpy.props.BoolProperty(
         name = "Activate Overlay",
-        default = False
+        default = False,
+        update = _update_active_overlay
     ) # type: ignore
-    
+
     only_active_layer : bpy.props.BoolProperty(
         name = "Only Render active layer",
-        default = True
+        default = True,
+        update = _update_only_active_layer
     ) # type: ignore
     
     use_combined : bpy.props.BoolProperty(

@@ -1,4 +1,4 @@
-# segment-anything-hq constraints
---extra-index-url https://download.pytorch.org/whl/cu121
-torch == 2.2.2
-torchvision == 0.17.2
+# SAM3 constraints
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch == 2.7.0
+torchvision == 0.22.0

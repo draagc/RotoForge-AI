@@ -30,9 +30,17 @@ def empty_cache():
         torch.mps.empty_cache()
 
 
-def get_predictor(model_type):
-    import segment_anything_hq
-    from .install_dependencies import get_install_folder
+def get_predictor(model_type=None):
+    try:
+        from sam3.model_builder import build_sam3_image_model
+        from sam3.model.sam3_image_processor import Sam3Processor
+        from .install_dependencies import get_install_folder
+    except ImportError as e:
+        print(f'Failed to import SAM3: {e}')
+        print('SAM3 may not be properly installed or has known import issues.')
+        print('Please try: pip install git+https://github.com/facebookresearch/sam3.git')
+        print('See: https://github.com/facebookresearch/sam3/issues/225')
+        raise e
     
     # Empty the memory cache before to clean up any mess that's been handed over
     empty_cache()
@@ -45,31 +53,34 @@ def get_predictor(model_type):
     print(f"Using {device_name}")
 
     # Fetch predictor
-    print('loading predictor')
-    sam_checkpoint = f"{get_install_folder('sam_hq_weights')}/sam_hq_{model_type}.pth"
+    print('loading SAM3 model')
+    sam_checkpoint = f"{get_install_folder('sam3_weights')}/sam3.0.pt"
 
-    # On non-CUDA systems, we need to specify map_location for torch.load
-    # Monkey-patch the checkpoint loading to handle device mapping
-    if device != "cuda":
-        # Load checkpoint with explicit device mapping
+    # Build SAM3 model - note that SAM3 doesn't use model_type in the same way
+    # It loads the complete model checkpoint directly
+    try:
+        model = build_sam3_image_model()
+        # Load checkpoint with device mapping
         checkpoint_dict = torch.load(sam_checkpoint, map_location=device)
-        sam = segment_anything_hq.sam_model_registry[model_type](checkpoint=None)
-        sam.load_state_dict(checkpoint_dict)
-        sam.to(device=device)
-    else:
-        # CUDA can load normally
-        sam = segment_anything_hq.sam_model_registry[model_type](checkpoint=sam_checkpoint)
-        sam.to(device=device)
-
-    predictor = segment_anything_hq.SamPredictor(sam)
-
-    print('loaded predictor')
-    
-    # Empty the memory cache after using SAM because Meta forgot
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    
-    return predictor
+        model.load_state_dict(checkpoint_dict)
+        model.to(device=device)
+        model.eval()
+        
+        # Create processor
+        processor = Sam3Processor(model)
+        
+        print('loaded SAM3 processor')
+        
+        # Empty the memory cache after loading
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        return processor
+        
+    except Exception as e:
+        print(f'Error loading SAM3 model: {e}')
+        print('Make sure the model checkpoint is downloaded and accessible')
+        raise e
 
 
 
@@ -128,35 +139,66 @@ def get_cropped_image(pixels_uint8_rgba, guide_mask, input_points, input_box, in
 
 
 
-def predict_mask(pixels_uint8_rgb, predictor, guide_mask, guide_strength, input_points, input_labels, input_box, input_logits):
-    # Generate mask
-    predictor.set_image(pixels_uint8_rgb)
-    masks, scores, logits = predictor.predict(
-        point_coords=input_points,
-        point_labels=input_labels,
-        box=input_box,
-        mask_input=input_logits,
-        multimask_output=True,
-    )
-    # Empty the memory cache after using SAM because Meta forgot
-    empty_cache()
-    # Initialize variables outside the loop
-    best_score = float('-inf')
-    cropped_area = len(pixels_uint8_rgb.flatten())/3
-    best_mask = None
-    best_logits = None
-    # Calculate sums outside the loop if they don't change
-    if guide_mask is not None:
-        sum_guide_mask = np.sum(guide_mask)
-    for i, score in enumerate(scores):
-        if guide_mask is not None:
-            score += -abs(sum_guide_mask - np.sum(masks[i])) / cropped_area * guide_strength
-        if score > best_score:
-            best_score = score
-            best_mask = masks[i]
-            best_logits = logits[i]
+def predict_mask(pixels_uint8_rgb, processor, guide_mask, guide_strength, input_points, input_labels, input_box, input_logits):
+    from PIL import Image
     
-    return best_mask, best_logits
+    # Convert numpy array to PIL Image for SAM3 processor
+    image = Image.fromarray(pixels_uint8_rgb)
+    
+    # Set image in processor
+    inference_state = processor.set_image(image)
+    
+    # For SAM3 point/box prompting, we need to use the instance interactivity mode
+    masks_list = []
+    scores_list = []
+    logits_list = []
+    
+    # Handle different prompt types
+    if input_points is not None and len(input_points) > 0:
+        # Point prompting - convert to format SAM3 expects
+        point_coords = [[int(point[0]), int(point[1])] for point in input_points]
+        point_labels = [int(label) if label is not None else 1 for label in (input_labels or [1] * len(point_coords))]
+        
+        # Use SAM3's point prompting
+        output = processor.set_point_prompt(
+            state=inference_state,
+            point_coords=point_coords,
+            point_labels=point_labels
+        )
+        
+        if output and "masks" in output:
+            masks_list.extend(output["masks"])
+            scores_list.extend(output["scores"])
+            logits_list.extend(output["logits"])
+    
+    # If we have masks from prompts, select the best one
+    if masks_list:
+        # Initialize variables outside the loop
+        best_score = float('-inf')
+        cropped_area = len(pixels_uint8_rgb.flatten())/3
+        best_mask = None
+        best_logits = None
+        
+        # Calculate sums outside the loop if they don't change
+        if guide_mask is not None:
+            sum_guide_mask = np.sum(guide_mask)
+            
+        for i, score in enumerate(scores_list):
+            current_score = score
+            if guide_mask is not None:
+                current_score += -abs(sum_guide_mask - np.sum(masks_list[i])) / cropped_area * guide_strength
+            if current_score > best_score:
+                best_score = current_score
+                best_mask = masks_list[i]
+                best_logits = logits_list[i]
+        
+        # Empty the memory cache after using SAM3
+        empty_cache()
+        return best_mask, best_logits
+    else:
+        # No masks generated, return empty results
+        empty_cache()
+        return None, None
 
 
 
@@ -225,7 +267,7 @@ def save_singular_logits(source_image, input_logits, sam_logits):
 def generate_mask(
     source_image, 
     used_mask,
-    predictor, 
+    processor, 
     guide_mask = None,
     guide_strength = 10,
     blur_radius = 0.2,
@@ -243,8 +285,12 @@ def generate_mask(
     print('loaded image')
 
     print('predicting masks')
-    best_mask, best_logits = predict_mask(pixels_uint8_rgb, predictor, guide_mask, guide_strength, input_points, input_labels, input_box, input_logits)
+    best_mask, best_logits = predict_mask(pixels_uint8_rgb, processor, guide_mask, guide_strength, input_points, input_labels, input_box, input_logits)
     print('predicted masks')
+
+    if best_mask is None:
+        print('No mask generated, skipping save')
+        return
 
     print('saving mask')
     save_singular_mask(source_image, used_mask, best_mask, cropping_box, blur_radius)
@@ -265,7 +311,7 @@ def generate_mask(
 def track_mask(
     source_image, 
     used_mask,
-    predictor, 
+    processor, 
     guide_mask = None,
     guide_strength = 10,
     blur_radius = 0.2,
@@ -280,7 +326,11 @@ def track_mask(
     pixels_uint8_rgba = bpyimg_to_HWCuint8(source_image)
     pixels_uint8_rgb, cropping_box, input_logits, input_box, input_points = get_cropped_image(pixels_uint8_rgba, guide_mask, input_points, input_box, input_logits)
     
-    best_mask, best_logits = predict_mask(pixels_uint8_rgb, predictor, guide_mask, guide_strength, input_points, input_labels, input_box, input_logits)
+    best_mask, best_logits = predict_mask(pixels_uint8_rgb, processor, guide_mask, guide_strength, input_points, input_labels, input_box, input_logits)
+    
+    if best_mask is None:
+        print('No mask generated during tracking')
+        return None, None, None, None
     
     overlay_l = save_sequential_mask(source_image, used_mask, best_mask, cropping_box, blur_radius)
 

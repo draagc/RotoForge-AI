@@ -81,6 +81,8 @@ def update_maskseq(used_mask, outdated=False):
         if used_mask in bpy.data.images:
             img = bpy.data.images[used_mask]
             img.filepath = new_path
+            # Clear movie cache after filepath change to prevent render crashes
+            img.reload()
         else:
             img = bpy.data.images.load(filepath=new_path, check_existing=True)
             if len(os.listdir(img_seq_dir)) > 1:
@@ -253,12 +255,9 @@ class MaskGenControls(bpy.types.PropertyGroup):
     used_model : bpy.props.EnumProperty(
         name = "Used Model",
         items = [
-            ("vit_tiny", "Light", "Use the light HQ-Sam model (very fast with decent quality)"),
-            ("vit_b", "Base", "Use the base HQ-Sam model that comes with SAM (fast with bad quality)"),
-            ("vit_l", "Large", "Use the large HQ-Sam model that comes with SAM (slow with medium quality)"),
-            ("vit_h", "Huge", "Use the huge HQ-Sam model that comes with SAM (very slow with best quality)"),
+            ("sam3", "SAM3", "Use SAM3 model with enhanced text prompting and performance"),
         ],
-        default= 'vit_tiny'
+        default= 'sam3'
     ) # type: ignore
     
     guide_strength : bpy.props.FloatProperty(
@@ -318,25 +317,37 @@ def prepare_new_project(origin):
 # Def a func that copies masksequences from local to tmp and then loads them into blender
 # Will be called when an old project is loaded
 def load_project(origin):
+    # CRITICAL FIX: Remove all mask images first to clear stale movie caches
+    # When a project is loaded, image data-blocks exist but their movie caches
+    # point to old/invalid data from the previous session
+    mask_images_to_remove = []
+    for image in bpy.data.images:
+        if image.source == 'SEQUENCE' and ('/MaskLayers/' in image.name or '/Combined' in image.name):
+            mask_images_to_remove.append(image.name)
+
+    for img_name in mask_images_to_remove:
+        if img_name in bpy.data.images:
+            bpy.data.images.remove(bpy.data.images[img_name], do_unlink=True)
+
     # Copy the masksequences to tmp
     tmp_path = os.path.join(bpy.app.tempdir, 'RotoForge')
     local_path = bpy.path.abspath('//RotoForge')
     # Copy all files from local to tmp
     if os.path.isdir(local_path):
         shutil.copytree(local_path, tmp_path, dirs_exist_ok=True)
-    
+
     # Creates all missing twins of the layers in mask.rotoforge_maskgencontrols
     for mask in bpy.data.masks:
         for layer in mask.layers:
-            # Load masksequence into blenders memory
+            # Load masksequence into blenders memory with fresh cache
             folder = f"{mask.name}/MaskLayers/{layer.name}"
             update_maskseq(folder)
-            
+
             # Append the layer to the rf layer collection
             if layer.name not in mask.rotoforge_maskgencontrols:
                 rf_layer = mask.rotoforge_maskgencontrols.add()
                 rf_layer.name = layer.name
-        
+
         # Update images of baked masks
         if os.path.isdir(get_rotoforge_dir(f"masksequences/{mask.name}/Combined")):
             folder = f"{mask.name}/Combined"
