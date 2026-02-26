@@ -1,291 +1,96 @@
-import bpy
+"""
+RotoForge AI - Mask Generation
 
+Handles image pixel extraction, crop/uncrop logic, and delegates
+actual SAM3 inference to the server via SAM3Client.
+
+No torch or sam3 imports — runs entirely in Blender's Python.
+"""
+
+import bpy
+import os
+import shutil
 import numpy as np
 import PIL.Image
-import torch
+import PIL.ImageFilter
 
 from .prompt_utils import fake_logits, calculate_bounding_box
-from .data_manager import save_sequential_mask, save_singular_mask
-
-
-def get_device():
-    """Detect and return the best available device (CUDA > MPS > CPU).
-
-    Returns:
-        tuple: (device_str, device_name) e.g. ("cuda", "CUDA acceleration")
-    """
-    if torch.cuda.is_available():
-        return "cuda", "CUDA acceleration"
-    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-        return "mps", "MPS acceleration (Apple Silicon)"
-    else:
-        return "cpu", "CPU"
-
-
-def empty_cache():
-    """Empty the memory cache for the current device."""
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-        torch.mps.empty_cache()
-
-
-def get_predictor(model_type=None):
-    try:
-        from sam3.model_builder import build_sam3_image_model
-        from sam3.model.sam3_image_processor import Sam3Processor
-        from .install_dependencies import get_install_folder
-    except ImportError as e:
-        print(f'Failed to import SAM3: {e}')
-        print('SAM3 may not be properly installed or has known import issues.')
-        print('Please try: pip install git+https://github.com/facebookresearch/sam3.git')
-        print('See: https://github.com/facebookresearch/sam3/issues/225')
-        raise e
-    
-    # Empty the memory cache before to clean up any mess that's been handed over
-    empty_cache()
-
-    # Debug info
-    print("PyTorch version: ", torch.__version__)
-
-    # Device selection: CUDA > MPS > CPU
-    device, device_name = get_device()
-    print(f"Using {device_name}")
-
-    # Fetch predictor
-    print('loading SAM3 model')
-    sam_checkpoint = f"{get_install_folder('sam3_weights')}/sam3.0.pt"
-
-    # Build SAM3 model - note that SAM3 doesn't use model_type in the same way
-    # It loads the complete model checkpoint directly
-    try:
-        model = build_sam3_image_model()
-        # Load checkpoint with device mapping
-        checkpoint_dict = torch.load(sam_checkpoint, map_location=device)
-        model.load_state_dict(checkpoint_dict)
-        model.to(device=device)
-        model.eval()
-        
-        # Create processor
-        processor = Sam3Processor(model)
-        
-        print('loaded SAM3 processor')
-        
-        # Empty the memory cache after loading
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        
-        return processor
-        
-    except Exception as e:
-        print(f'Error loading SAM3 model: {e}')
-        print('Make sure the model checkpoint is downloaded and accessible')
-        raise e
-
-
+from .data_manager import save_sequential_mask, save_singular_mask, get_rotoforge_dir
 
 
 def bpyimg_to_HWCuint8(source_image):
-    # Get the image pixel data as a numpy array:
+    """Convert a Blender image to HxWx4 uint8 numpy array."""
     source_pixels = np.zeros(len(source_image.pixels), dtype=np.float32)
     source_image.pixels.foreach_get(source_pixels)
 
-    # Determine the dimensions of the image
     width = source_image.size[0]
     height = source_image.size[1]
 
-    # Reshape the pixel data into HWC uint8 format
-    channels = 4
-    pixels_HWC_uint8 = (np.array(source_pixels).reshape(height, width, channels)* 255).astype(np.uint8)
+    pixels_HWC_uint8 = (source_pixels.reshape(height, width, 4) * 255).astype(np.uint8)
     return pixels_HWC_uint8
 
 
-
-def get_cropped_image(pixels_uint8_rgba, guide_mask, input_points, input_box, input_logits):
-    # Determine the dimensions of the image
+def get_cropped_image(pixels_uint8_rgba, guide_mask, input_points, input_box):
+    """Crop image and prompts to the bounding box region for efficiency."""
     cropping_radius = 0.05
     width = pixels_uint8_rgba.shape[1]
     height = pixels_uint8_rgba.shape[0]
-    
-    # Load data into PIL
+
     img = PIL.Image.fromarray(pixels_uint8_rgba)
     img = img.convert('RGB')
-    
-    # Crop to box if box is supported
+
     if input_box is not None:
-        mask = PIL.Image.fromarray(guide_mask)
-        cropping_box = input_box + np.array([-width*cropping_radius, -height*cropping_radius, width*cropping_radius, height*cropping_radius])
+        mask = PIL.Image.fromarray(guide_mask) if guide_mask is not None else None
+        cropping_box = input_box + np.array([
+            -width * cropping_radius, -height * cropping_radius,
+            width * cropping_radius, height * cropping_radius
+        ])
         img = img.crop(cropping_box)
-        mask = mask.crop(cropping_box)
+        if mask is not None:
+            mask = mask.crop(cropping_box)
         if input_points is not None:
             input_points = input_points - [cropping_box[0], cropping_box[1]]
-        input_box = np.array([width*cropping_radius, height*cropping_radius, input_box[2]-input_box[0] + width*cropping_radius, input_box[3]-input_box[1] + height*cropping_radius])
-        
-        if input_logits is not None:
-            input_logits = np.array([input_logits])
-        else:
-            input_logits = fake_logits(mask)
+        input_box = np.array([
+            width * cropping_radius, height * cropping_radius,
+            input_box[2] - input_box[0] + width * cropping_radius,
+            input_box[3] - input_box[1] + height * cropping_radius
+        ])
     else:
-        input_logits = None
         cropping_box = None
-        
-    
+
     pixels_uint8_rgb = np.asarray(img)
-
-    return pixels_uint8_rgb, cropping_box, input_logits, input_box, input_points
-
+    return pixels_uint8_rgb, cropping_box, input_box, input_points
 
 
-
-
-
-def predict_mask(pixels_uint8_rgb, processor, guide_mask, guide_strength, input_points, input_labels, input_box, input_logits):
-    from PIL import Image
-    
-    # Convert numpy array to PIL Image for SAM3 processor
-    image = Image.fromarray(pixels_uint8_rgb)
-    
-    # Set image in processor
-    inference_state = processor.set_image(image)
-    
-    # For SAM3 point/box prompting, we need to use the instance interactivity mode
-    masks_list = []
-    scores_list = []
-    logits_list = []
-    
-    # Handle different prompt types
-    if input_points is not None and len(input_points) > 0:
-        # Point prompting - convert to format SAM3 expects
-        point_coords = [[int(point[0]), int(point[1])] for point in input_points]
-        point_labels = [int(label) if label is not None else 1 for label in (input_labels or [1] * len(point_coords))]
-        
-        # Use SAM3's point prompting
-        output = processor.set_point_prompt(
-            state=inference_state,
-            point_coords=point_coords,
-            point_labels=point_labels
-        )
-        
-        if output and "masks" in output:
-            masks_list.extend(output["masks"])
-            scores_list.extend(output["scores"])
-            logits_list.extend(output["logits"])
-    
-    # If we have masks from prompts, select the best one
-    if masks_list:
-        # Initialize variables outside the loop
-        best_score = float('-inf')
-        cropped_area = len(pixels_uint8_rgb.flatten())/3
-        best_mask = None
-        best_logits = None
-        
-        # Calculate sums outside the loop if they don't change
-        if guide_mask is not None:
-            sum_guide_mask = np.sum(guide_mask)
-            
-        for i, score in enumerate(scores_list):
-            current_score = score
-            if guide_mask is not None:
-                current_score += -abs(sum_guide_mask - np.sum(masks_list[i])) / cropped_area * guide_strength
-            if current_score > best_score:
-                best_score = current_score
-                best_mask = masks_list[i]
-                best_logits = logits_list[i]
-        
-        # Empty the memory cache after using SAM3
-        empty_cache()
-        return best_mask, best_logits
-    else:
-        # No masks generated, return empty results
-        empty_cache()
-        return None, None
-
-
-
-
-
-# Debug func for testing model input
-def save_singular_logits(source_image, input_logits, sam_logits):
-    
-    # Create new image
-    new_name = source_image.name
-    if new_name.rfind('.') == -1:
-        new_name = new_name + '_FAKElogits'
-    else:
-        new_name = new_name[:new_name.rfind('.')] + '_FAKElogits' + new_name[new_name.rfind('.'):]
-    logits_image = bpy.data.images.new(new_name, width=256, height=256, is_data=True, alpha=False, float_buffer=True)
-    print('Fake logits')
-    print('Shape: ', str(input_logits.shape))
-    print('Min: ', str(np.min(input_logits)))
-    print('Max: ', str(np.max(input_logits)))
-    # Convert Binary Mask to image data
-    best_logits_flat = np.array(input_logits).flatten()
-    logits_data_data = np.where(best_logits_flat[:, None], [1, 1, 1, 1], [0, 0, 0, 1])
-    np_logits_data = np.array(logits_data_data, dtype=np.float32).flatten()
-    # Write mask to image
-    logits_image.pixels.foreach_set(np_logits_data)
-    # Save the image
-    logits_image.pack()
-    logits_image.update()
-    
-    
-    
-    # Create new image
-    new_name = source_image.name
-    if new_name.rfind('.') == -1:
-        new_name = new_name + '_SAMlogits'
-    else:
-        new_name = new_name[:new_name.rfind('.')] + '_SAMlogits' + new_name[new_name.rfind('.'):]
-    logits_image = bpy.data.images.new(source_image.name + "_SAMlogits", width=256, height=256, is_data=True, alpha=False, float_buffer=True)
-    
-    print('Sam logits')
-    print('Shape: ', str(sam_logits.shape))
-    print('Min: ', str(np.min(sam_logits)))
-    print('Max: ', str(np.max(sam_logits)))
-    logits_data = (sam_logits-np.min(sam_logits))/np.max(sam_logits-np.min(sam_logits))
-    logits_data =  np.expand_dims(logits_data, axis=2)  # Add an additional dimension
-    logits_data = np.concatenate([logits_data]*3, axis=2)
-    # Set the alpha channel to 1 for all pixels
-    alpha_channel = np.ones_like(logits_data[:, :, :1])  # Set alpha channel to 1 (fully opaque)
-    logits_data = np.concatenate([logits_data, alpha_channel], axis=2)  # Concatenate alpha channel
-    np_logits_data = np.array(logits_data, dtype=np.float32).flatten()
-    # Write mask to image
-    logits_image.pixels.foreach_set(np_logits_data)
-    # Save the image
-    logits_image.pack()
-    logits_image.update()
-
-
-
-
-
-
-
-
-
+# ---------------------------------------------------------------------------
+# Point/box prompt generation
+# ---------------------------------------------------------------------------
 
 def generate_mask(
-    source_image, 
+    source_image,
     used_mask,
-    processor, 
-    guide_mask = None,
-    guide_strength = 10,
-    blur_radius = 0.2,
-    input_points = None,
-    input_labels = None,
-    input_box = None,
-    debug_logits = False,
+    client,
+    guide_mask=None,
+    guide_strength=10,
+    blur_radius=0.2,
+    input_points=None,
+    input_labels=None,
+    input_box=None,
 ):
-
-    
+    """Generate a single-frame mask using point/box prompts via the server."""
 
     print('loading image')
     pixels_uint8_rgba = bpyimg_to_HWCuint8(source_image)
-    pixels_uint8_rgb, cropping_box, input_logits, input_box, input_points = get_cropped_image(pixels_uint8_rgba, guide_mask, input_points, input_box, None)
+    pixels_uint8_rgb, cropping_box, input_box, input_points = get_cropped_image(
+        pixels_uint8_rgba, guide_mask, input_points, input_box
+    )
     print('loaded image')
 
-    print('predicting masks')
-    best_mask, best_logits = predict_mask(pixels_uint8_rgb, processor, guide_mask, guide_strength, input_points, input_labels, input_box, input_logits)
+    print('predicting masks (point prompt)')
+    best_mask, best_logits = _predict_and_select(
+        client, pixels_uint8_rgb, guide_mask, guide_strength,
+        input_points, input_labels, input_box,
+    )
     print('predicted masks')
 
     if best_mask is None:
@@ -295,52 +100,476 @@ def generate_mask(
     print('saving mask')
     save_singular_mask(source_image, used_mask, best_mask, cropping_box, blur_radius)
     print('saved mask')
-    
-    if debug_logits:
-        print('saving logits')
-        save_singular_logits(source_image, input_logits, best_logits)
-        print('saved logits')
-        
-
-
-
-
-
 
 
 def track_mask(
-    source_image, 
+    source_image,
     used_mask,
-    processor, 
-    guide_mask = None,
-    guide_strength = 10,
-    blur_radius = 0.2,
-    search_radius = 10,
-    input_points = None,
-    input_labels = None,
-    input_box = None,
-    input_logits = None
+    client,
+    guide_mask=None,
+    guide_strength=10,
+    blur_radius=0.2,
+    search_radius=10,
+    input_points=None,
+    input_labels=None,
+    input_box=None,
 ):
-    
-    #Process the frame
+    """Track a mask across one frame using point/box prompts."""
+
     pixels_uint8_rgba = bpyimg_to_HWCuint8(source_image)
-    pixels_uint8_rgb, cropping_box, input_logits, input_box, input_points = get_cropped_image(pixels_uint8_rgba, guide_mask, input_points, input_box, input_logits)
-    
-    best_mask, best_logits = predict_mask(pixels_uint8_rgb, processor, guide_mask, guide_strength, input_points, input_labels, input_box, input_logits)
-    
+    pixels_uint8_rgb, cropping_box, input_box, input_points = get_cropped_image(
+        pixels_uint8_rgba, guide_mask, input_points, input_box
+    )
+
+    best_mask, best_logits = _predict_and_select(
+        client, pixels_uint8_rgb, guide_mask, guide_strength,
+        input_points, input_labels, input_box,
+    )
+
     if best_mask is None:
         print('No mask generated during tracking')
         return None, None, None, None
-    
+
     overlay_l = save_sequential_mask(source_image, used_mask, best_mask, cropping_box, blur_radius)
 
-    #Set input data for next frame
-    input_box = calculate_bounding_box(best_mask)
-
-    # Handle case where no bounding box is found (empty mask)
-    if input_box is not None:
-        input_box = np.array([input_box[0] - search_radius, input_box[1] - search_radius, input_box[2] + search_radius, input_box[3] + search_radius])
+    new_box = calculate_bounding_box(best_mask)
+    if new_box is not None:
+        new_box = np.array([
+            new_box[0] - search_radius, new_box[1] - search_radius,
+            new_box[2] + search_radius, new_box[3] + search_radius
+        ])
         if cropping_box is not None:
-            input_box = np.array([input_box[0] + cropping_box[0], input_box[1] + cropping_box[1], input_box[2] + cropping_box[0], input_box[3] + cropping_box[1]])
+            new_box = np.array([
+                new_box[0] + cropping_box[0], new_box[1] + cropping_box[1],
+                new_box[2] + cropping_box[0], new_box[3] + cropping_box[1]
+            ])
 
-    return best_mask, input_box, overlay_l, best_logits
+    return best_mask, new_box, overlay_l, best_logits
+
+
+def _predict_and_select(client, pixels_uint8_rgb, guide_mask, guide_strength,
+                        input_points, input_labels, input_box):
+    """Call the server's point-prompt endpoint and pick the best mask."""
+
+    masks, scores, low_res = client.predict_points(
+        image_rgb=pixels_uint8_rgb,
+        input_points=input_points,
+        input_labels=input_labels,
+        input_box=input_box,
+        multimask_output=True,
+    )
+
+    if masks is None or len(masks) == 0:
+        return None, None
+
+    best_score = float('-inf')
+    best_mask = None
+    best_logits = None
+    cropped_area = pixels_uint8_rgb.size / 3
+
+    if guide_mask is not None:
+        sum_guide = float(np.sum(guide_mask))
+
+    for i in range(len(scores)):
+        current = float(scores[i])
+        if guide_mask is not None:
+            current += -abs(sum_guide - np.sum(masks[i])) / cropped_area * guide_strength
+        if current > best_score:
+            best_score = current
+            best_mask = masks[i]
+            best_logits = low_res[i] if low_res is not None else None
+
+    return best_mask, best_logits
+
+
+# ---------------------------------------------------------------------------
+# Text prompt generation — multi-instance support
+# ---------------------------------------------------------------------------
+
+def _select_text_masks(masks, scores, multi_mode):
+    """Apply multi-instance mode to text prompt results.
+
+    Args:
+        masks: NxHxW bool/uint8 array of detected instance masks.
+        scores: N array of confidence scores.
+        multi_mode: 'best', 'union', or 'separate'.
+
+    Returns:
+        list of masks (each HxW). For 'best'/'union' this is a single-element
+        list; for 'separate' it's one mask per detection, sorted by score.
+    """
+    if masks is None or len(masks) == 0:
+        return []
+
+    if multi_mode == 'best':
+        best_idx = int(np.argmax(scores))
+        return [masks[best_idx].astype(np.uint8) * 255]
+
+    if multi_mode == 'union':
+        combined = np.zeros_like(masks[0], dtype=np.uint8)
+        for m in masks:
+            combined = np.maximum(combined, m.astype(np.uint8) * 255)
+        return [combined]
+
+    # 'separate' — return each mask individually, highest score first
+    order = np.argsort(scores)[::-1]
+    return [(masks[i].astype(np.uint8) * 255) for i in order]
+
+
+def generate_mask_text(
+    source_image,
+    used_mask,
+    client,
+    text_prompt,
+    blur_radius=0.2,
+    confidence_threshold=0.5,
+    multi_mode='union',
+):
+    """Generate mask(s) using a text prompt via the server.
+
+    For 'best' and 'union' modes, writes one mask to used_mask.
+    For 'separate' mode, returns a list of masks (caller creates layers).
+    """
+
+    print('loading image')
+    pixels_uint8_rgba = bpyimg_to_HWCuint8(source_image)
+    img = PIL.Image.fromarray(pixels_uint8_rgba).convert('RGB')
+    pixels_uint8_rgb = np.asarray(img)
+    print('loaded image')
+
+    print(f'predicting masks (text: "{text_prompt}", mode: {multi_mode})')
+    masks, boxes, scores = client.predict_text(
+        image_rgb=pixels_uint8_rgb,
+        prompt=text_prompt,
+        confidence_threshold=confidence_threshold,
+    )
+    print(f'predicted {len(masks) if masks is not None else 0} instance(s)')
+
+    selected = _select_text_masks(masks, scores, multi_mode)
+
+    if not selected:
+        print('No mask generated for text prompt, skipping save')
+        return []
+
+    if multi_mode == 'separate':
+        # Return the masks — the caller (operator) creates separate layers
+        return selected
+
+    print('saving mask')
+    save_singular_mask(source_image, used_mask, selected[0], None, blur_radius)
+    print('saved mask')
+    return selected
+
+
+def track_mask_text(
+    source_image,
+    used_mask,
+    client,
+    text_prompt,
+    blur_radius=0.2,
+    search_radius=10,
+    confidence_threshold=0.5,
+    multi_mode='union',
+):
+    """Track a mask across one frame using a text prompt."""
+
+    pixels_uint8_rgba = bpyimg_to_HWCuint8(source_image)
+    img = PIL.Image.fromarray(pixels_uint8_rgba).convert('RGB')
+    pixels_uint8_rgb = np.asarray(img)
+
+    masks, boxes, scores = client.predict_text(
+        image_rgb=pixels_uint8_rgb,
+        prompt=text_prompt,
+        confidence_threshold=confidence_threshold,
+    )
+
+    selected = _select_text_masks(masks, scores, multi_mode)
+
+    if not selected:
+        print('No mask generated during text tracking')
+        return None, None, None
+
+    # For tracking we always use a single combined mask (even in 'separate' mode,
+    # union them for the tracking frame since we need one overlay / one bounding box)
+    if len(selected) > 1:
+        combined = np.zeros_like(selected[0], dtype=np.uint8)
+        for m in selected:
+            combined = np.maximum(combined, m)
+        result_mask = combined
+    else:
+        result_mask = selected[0]
+
+    overlay_l = save_sequential_mask(source_image, used_mask, result_mask, None, blur_radius)
+
+    new_box = calculate_bounding_box(result_mask)
+    if new_box is not None:
+        new_box = np.array([
+            new_box[0] - search_radius, new_box[1] - search_radius,
+            new_box[2] + search_radius, new_box[3] + search_radius
+        ])
+
+    return result_mask, new_box, overlay_l
+
+
+# ---------------------------------------------------------------------------
+# Video tracking — SAM3 native temporal tracking
+# ---------------------------------------------------------------------------
+
+def _export_frames_to_jpeg(source_image, frame_start, frame_end):
+    """Export Blender image sequence frames to a temp JPEG directory.
+
+    Returns the path to the directory and the frame-to-index mapping.
+    The video predictor expects JPEG files named 00000.jpg, 00001.jpg, etc.
+    """
+    frames_dir = os.path.join(get_rotoforge_dir(), "video_frames_tmp")
+    if os.path.isdir(frames_dir):
+        shutil.rmtree(frames_dir)
+    os.makedirs(frames_dir)
+
+    context = bpy.context
+    space = context.space_data
+    original_frame = context.scene.frame_current
+
+    frame_to_idx = {}
+    idx = 0
+
+    for frame_num in range(frame_start, frame_end + 1):
+        context.scene.frame_current = frame_num
+        space.image_user.frame_current = frame_num
+        # Force viewport update
+        space.display_channels = space.display_channels
+
+        pixels_rgba = bpyimg_to_HWCuint8(source_image)
+        img = PIL.Image.fromarray(pixels_rgba).convert('RGB')
+
+        filename = f"{idx:05d}.jpg"
+        img.save(os.path.join(frames_dir, filename), quality=95)
+        frame_to_idx[frame_num] = idx
+        idx += 1
+
+    context.scene.frame_current = original_frame
+    print(f'Exported {idx} frames to {frames_dir}')
+    return frames_dir, frame_to_idx
+
+
+def _idx_to_frame(frame_to_idx):
+    """Invert the frame_to_idx mapping."""
+    return {v: k for k, v in frame_to_idx.items()}
+
+
+def track_video_text(
+    source_image,
+    used_mask,
+    client,
+    text_prompt,
+    frame_start,
+    frame_end,
+    prompt_frame,
+    blur_radius=0.2,
+    confidence_threshold=0.5,
+    direction="both",
+    progress_callback=None,
+):
+    """Run SAM3 video tracking with a text prompt.
+
+    Exports frames, starts a video session, prompts on prompt_frame,
+    propagates, and saves all resulting masks.
+
+    Args:
+        progress_callback: optional callable(frame_num, total_frames)
+            for UI progress reporting.
+
+    Returns:
+        number of frames successfully tracked.
+    """
+    print(f'Exporting frames {frame_start}-{frame_end}...')
+    local_frames_dir, frame_to_idx = _export_frames_to_jpeg(
+        source_image, frame_start, frame_end
+    )
+    idx_to_frame = _idx_to_frame(frame_to_idx)
+
+    if not client.is_video_model_loaded():
+        print('Loading video model...')
+        client.load_video_model()
+
+    if client._is_remote:
+        server_frames_dir = client.video_upload_frames(local_frames_dir)
+    else:
+        server_frames_dir = local_frames_dir
+
+    session_id = client.video_start_session(server_frames_dir)
+
+    try:
+        if prompt_frame not in frame_to_idx:
+            prompt_frame = max(frame_start, min(prompt_frame, frame_end))
+        prompt_idx = frame_to_idx[prompt_frame]
+        print(f'Adding text prompt "{text_prompt}" on frame {prompt_frame} (idx {prompt_idx})')
+
+        result = client.video_add_prompt(
+            session_id=session_id,
+            frame_index=prompt_idx,
+            text=text_prompt,
+        )
+        if not result["masks"]:
+            print('No objects detected for text prompt on the initial frame')
+            return 0
+
+        print(f'Detected {len(result["obj_ids"])} object(s), propagating {direction}...')
+        all_frames = client.video_propagate(session_id, direction=direction)
+
+        saved = 0
+        total = len(all_frames)
+        max_frame = max(frame_end, bpy.context.scene.frame_end)
+        padding = len(str(max_frame))
+
+        for video_idx, frame_data in sorted(all_frames.items()):
+            if video_idx not in idx_to_frame:
+                continue
+
+            blender_frame = idx_to_frame[video_idx]
+            masks = frame_data["masks"]
+
+            if not masks:
+                continue
+
+            # Union all tracked objects into a single mask
+            combined = np.zeros_like(masks[0], dtype=np.uint8)
+            for m in masks:
+                combined = np.maximum(combined, m.astype(np.uint8) * 255)
+
+            # Apply blur
+            if blur_radius > 0:
+                pil_mask = PIL.Image.fromarray(combined).convert('RGBA')
+                pil_mask = pil_mask.filter(PIL.ImageFilter.BoxBlur(radius=blur_radius))
+            else:
+                pil_mask = PIL.Image.fromarray(combined).convert('RGBA')
+
+            # Save as PNG in the mask sequence directory
+            img_seq_dir = os.path.join(get_rotoforge_dir('masksequences'), used_mask)
+            if not os.path.isdir(img_seq_dir):
+                os.makedirs(img_seq_dir)
+
+            frame_str = str(blender_frame).zfill(padding)
+            flipped = pil_mask.transpose(PIL.Image.FLIP_TOP_BOTTOM)
+            flipped.save(os.path.join(img_seq_dir, f"{frame_str}.png"))
+            saved += 1
+
+            if progress_callback:
+                progress_callback(saved, total)
+
+        print(f'Saved {saved} tracked frames')
+        return saved
+
+    finally:
+        client.video_close_session(session_id)
+        if os.path.isdir(local_frames_dir):
+            shutil.rmtree(local_frames_dir)
+
+
+def track_video_points(
+    source_image,
+    used_mask,
+    client,
+    frame_start,
+    frame_end,
+    prompt_frame,
+    input_points=None,
+    input_labels=None,
+    blur_radius=0.2,
+    direction="both",
+    progress_callback=None,
+):
+    """Run SAM3 video tracking with point prompts.
+
+    Points are in pixel coordinates and get normalized to [0, 1]
+    for the video predictor.
+    """
+    print(f'Exporting frames {frame_start}-{frame_end}...')
+    local_frames_dir, frame_to_idx = _export_frames_to_jpeg(
+        source_image, frame_start, frame_end
+    )
+    idx_to_frame = _idx_to_frame(frame_to_idx)
+
+    if not client.is_video_model_loaded():
+        print('Loading video model...')
+        client.load_video_model()
+
+    if client._is_remote:
+        server_frames_dir = client.video_upload_frames(local_frames_dir)
+    else:
+        server_frames_dir = local_frames_dir
+
+    session_id = client.video_start_session(server_frames_dir)
+
+    try:
+        if prompt_frame not in frame_to_idx:
+            prompt_frame = max(frame_start, min(prompt_frame, frame_end))
+        prompt_idx = frame_to_idx[prompt_frame]
+        width, height = source_image.size
+
+        # Normalize points to [0, 1] for video predictor
+        norm_points = None
+        if input_points is not None:
+            norm_points = [[float(p[0]) / width, float(p[1]) / height] for p in input_points]
+        norm_labels = None
+        if input_labels is not None:
+            norm_labels = [int(l) for l in input_labels]
+
+        print(f'Adding point prompt on frame {prompt_frame} (idx {prompt_idx})')
+        result = client.video_add_prompt(
+            session_id=session_id,
+            frame_index=prompt_idx,
+            points=norm_points,
+            labels=norm_labels,
+        )
+        if not result["masks"]:
+            print('No objects detected for point prompt on the initial frame')
+            return 0
+
+        print(f'Propagating {direction}...')
+        all_frames = client.video_propagate(session_id, direction=direction)
+
+        saved = 0
+        total = len(all_frames)
+        max_frame = max(frame_end, bpy.context.scene.frame_end)
+        padding = len(str(max_frame))
+
+        for video_idx, frame_data in sorted(all_frames.items()):
+            if video_idx not in idx_to_frame:
+                continue
+
+            blender_frame = idx_to_frame[video_idx]
+            masks = frame_data["masks"]
+
+            if not masks:
+                continue
+
+            combined = np.zeros_like(masks[0], dtype=np.uint8)
+            for m in masks:
+                combined = np.maximum(combined, m.astype(np.uint8) * 255)
+
+            if blur_radius > 0:
+                pil_mask = PIL.Image.fromarray(combined).convert('RGBA')
+                pil_mask = pil_mask.filter(PIL.ImageFilter.BoxBlur(radius=blur_radius))
+            else:
+                pil_mask = PIL.Image.fromarray(combined).convert('RGBA')
+
+            img_seq_dir = os.path.join(get_rotoforge_dir('masksequences'), used_mask)
+            if not os.path.isdir(img_seq_dir):
+                os.makedirs(img_seq_dir)
+
+            frame_str = str(blender_frame).zfill(padding)
+            flipped = pil_mask.transpose(PIL.Image.FLIP_TOP_BOTTOM)
+            flipped.save(os.path.join(img_seq_dir, f"{frame_str}.png"))
+            saved += 1
+
+            if progress_callback:
+                progress_callback(saved, total)
+
+        print(f'Saved {saved} tracked frames')
+        return saved
+
+    finally:
+        client.video_close_session(session_id)
+        if os.path.isdir(local_frames_dir):
+            shutil.rmtree(local_frames_dir)

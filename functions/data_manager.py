@@ -4,11 +4,34 @@ from bpy.app.handlers import persistent
 import os
 import shutil
 
-from packaging.version import Version
-import numpy as np
-import PIL.Image
-import PIL.ImageFilter
-current_version=Version('1.1.1')
+# These are deferred imports — may not be available until deps are installed.
+# Registration must succeed without them so the user can access the install button.
+np = None
+PIL_Image = None
+PIL_ImageFilter = None
+_deps_available = False
+
+def _ensure_deps():
+    global np, PIL_Image, PIL_ImageFilter, _deps_available
+    if _deps_available:
+        return True
+    try:
+        import numpy as _np
+        import PIL.Image as _PI
+        import PIL.ImageFilter as _PIF
+        np = _np
+        PIL_Image = _PI
+        PIL_ImageFilter = _PIF
+        _deps_available = True
+        return True
+    except ImportError:
+        return False
+
+def _parse_version(s):
+    """Simple tuple-based version comparison — no 'packaging' dependency."""
+    return tuple(int(x) for x in s.split('.'))
+
+current_version = _parse_version('1.1.1')
 
 def get_rotoforge_dir(folder = ''):
     return os.path.join(bpy.app.tempdir, 'RotoForge', folder)
@@ -34,16 +57,17 @@ def save_sequential_mask(source_image, used_mask, best_mask, cropping_box, blur 
     image_path = os.path.join(img_seq_dir, frame + '.png')
         
     # Convert Binary Mask to image data
-    best_mask = PIL.Image.fromarray(best_mask)
+    _ensure_deps()
+    best_mask = PIL_Image.fromarray(best_mask)
     best_mask = best_mask.convert(mode='RGBA')
-    best_mask = best_mask.filter(PIL.ImageFilter.BoxBlur(radius=blur))
+    best_mask = best_mask.filter(PIL_ImageFilter.BoxBlur(radius=blur))
     # Paste the cropped mask in a black image with the original res at the original position if cropping was used
     if cropping_box is not None:
-        empty_mask = PIL.Image.new('RGBA', (width, height), 'black')
+        empty_mask = PIL_Image.new('RGBA', (width, height), 'black')
         empty_mask.paste(best_mask, (int(cropping_box[0]), int(cropping_box[1] + 1)))
         best_mask = empty_mask
     # Save the image
-    flipped_mask = best_mask.transpose(PIL.Image.FLIP_TOP_BOTTOM)
+    flipped_mask = best_mask.transpose(PIL_Image.FLIP_TOP_BOTTOM)
     if not os.path.isdir(img_seq_dir):
         os.makedirs(img_seq_dir)
     flipped_mask.save(image_path)
@@ -76,8 +100,11 @@ def update_maskseq(used_mask, outdated=False):
     img_seq_dir = os.path.join(get_rotoforge_dir(folder), used_mask)
     
     if os.path.isdir(img_seq_dir):
+        files = sorted(os.listdir(img_seq_dir))
+        if not files:
+            return
         print('RotoForge AI: Updating Masksequence from path', img_seq_dir)
-        new_path = os.path.join(img_seq_dir, sorted(os.listdir(img_seq_dir))[0])
+        new_path = os.path.join(img_seq_dir, files[0])
         if used_mask in bpy.data.images:
             img = bpy.data.images[used_mask]
             img.filepath = new_path
@@ -281,6 +308,33 @@ class MaskGenControls(bpy.types.PropertyGroup):
         default = 10
     ) # type: ignore
     
+    text_prompt : bpy.props.StringProperty(
+        name = "Text Prompt",
+        description = "Describe the object to segment (SAM3 concept prompting)",
+        default = ""
+    ) # type: ignore
+    
+    text_confidence : bpy.props.FloatProperty(
+        name = "Confidence",
+        description = "Detection confidence threshold for text prompts",
+        default = 0.5,
+        min = 0.0,
+        max = 1.0,
+        soft_min = 0.1,
+        soft_max = 0.9
+    ) # type: ignore
+    
+    text_multi_mode : bpy.props.EnumProperty(
+        name = "Multi-Instance Mode",
+        description = "How to handle multiple detected instances from a text prompt",
+        items = [
+            ("best", "Best Match", "Use only the highest-confidence detection"),
+            ("union", "Union All", "Combine all detected instances into a single mask"),
+            ("separate", "Separate Layers", "Create a separate mask layer for each detected instance"),
+        ],
+        default = 'union'
+    ) # type: ignore
+    
     @classmethod 
     def register(cls):
         bpy.types.Mask.rotoforge_maskgencontrols = bpy.props.CollectionProperty(type=cls)
@@ -389,16 +443,16 @@ def update_old_projects(origin):
     if os.path.isfile(ver_txt_path):
         with open(ver_txt_path, 'r', encoding='utf-8') as file:
             content = file.readlines()
-        loaded_version = Version(content[1])
+        loaded_version = _parse_version(content[1].strip())
     else:
-        loaded_version = Version('1.0.0')
+        loaded_version = _parse_version('1.0.0')
 
     print(f'RotoForge AI: Extension version: {str(current_version)}; Project version: {str(loaded_version)}')
     
     if loaded_version < current_version:
         save_after_update = True
     
-    if loaded_version == Version('1.0.0'):
+    if loaded_version == _parse_version('1.0.0'):
         # Move '//RotoForge masksequences' to '//RotoForge/outdated_masksequences' and move from ospath to local
         
         # Moves all files from the old rf dir to the new rf dir for outdates masksequences

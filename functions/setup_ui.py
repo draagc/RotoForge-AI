@@ -1,235 +1,376 @@
+"""
+RotoForge AI - UI Operators and Panels
+
+Manages the SAM3 server lifecycle and exposes mask generation
+operators for both point/box and text prompting.
+"""
+
 import bpy
 import os
-
 from time import process_time
 
+from .install_dependencies import get_venv_python, get_server_script, get_install_folder
 
-from . import generate_masks
-from . import prompt_utils
-from . import overlay
-from . import mask_rasterize
-from . import data_manager
+# Lazy imports — these modules need numpy/PIL which may not be installed yet.
+# They're only actually used when an operator runs, not at registration time.
+SAM3Client = None
+generate_masks = None
+prompt_utils = None
+overlay = None
+mask_rasterize = None
+data_manager = None
 
-processor = None
-used_model = None
+
+def _ensure_modules():
+    global SAM3Client, generate_masks, prompt_utils, overlay, mask_rasterize, data_manager
+    if generate_masks is not None:
+        return
+    from .sam3_client import SAM3Client as _SC
+    from . import generate_masks as _gm
+    from . import prompt_utils as _pu
+    from . import overlay as _ov
+    from . import mask_rasterize as _mr
+    from . import data_manager as _dm
+    SAM3Client = _SC
+    generate_masks = _gm
+    prompt_utils = _pu
+    overlay = _ov
+    mask_rasterize = _mr
+    data_manager = _dm
+
+# ---------------------------------------------------------------------------
+# Server / client singleton
+# ---------------------------------------------------------------------------
+
+_client = None  # SAM3Client instance, created on demand
 
 
+def _get_prefs():
+    """Return the addon preferences."""
+    return bpy.context.preferences.addons[__package__.rsplit('.', 1)[0]].preferences
+
+
+def _get_client() -> SAM3Client:
+    """Return the module-level SAM3Client, creating it if needed.
+
+    Reads server_mode / server_host / server_port from addon preferences
+    and recreates the client if the connection target has changed.
+    """
+    global _client
+    _ensure_modules()
+    prefs = _get_prefs()
+    host = prefs.server_host if prefs.server_mode == "remote" else "127.0.0.1"
+    port = prefs.server_port
+
+    if _client is not None and (_client.host != host or _client.port != port):
+        try:
+            _client.stop_server()
+        except Exception:
+            pass
+        _client = None
+
+    if _client is None:
+        _client = SAM3Client(host=host, port=port)
+    return _client
+
+
+def _ensure_server_and_model(context):
+    """Make sure the server is running and the model is loaded.
+
+    In local mode, launches the subprocess if needed.
+    In remote mode, pings the remote server.
+
+    Returns the client, or raises RuntimeError.
+    """
+    _ensure_modules()
+    prefs = _get_prefs()
+    client = _get_client()
+
+    if not client.is_alive():
+        if prefs.server_mode == "remote":
+            client.connect_remote(timeout=10.0)
+        else:
+            python_exe = get_venv_python()
+            server_script = get_server_script()
+
+            if not os.path.isfile(python_exe):
+                raise RuntimeError(
+                    "SAM3 venv not found. Please install dependencies in the addon preferences."
+                )
+
+            checkpoint = os.path.join(get_install_folder(), "sam3.pt")
+            if not os.path.isfile(checkpoint):
+                checkpoint = None
+
+            client.start_server(python_exe, server_script, checkpoint=checkpoint)
+
+    if not client.is_model_loaded():
+        client.load_model()
+
+    return client
+
+
+def free_server():
+    """Free the model on the server (keep server running).
+
+    Works for both local and remote servers — just frees GPU memory.
+    """
+    global _client
+    if _client is None:
+        return
+    if _client.is_alive():
+        try:
+            _client.free_model()
+        except Exception:
+            pass
+
+
+def stop_server():
+    """Stop the server process entirely.
+
+    For remote servers this only drops the client reference — it does
+    NOT send /shutdown to a server we don't own.
+    """
+    global _client
+    if _client is not None:
+        _client.stop_server()
+        _client = None
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def time_checkpoint(start, name):
-    
-    # Get the elapsed time
-    elapsed_time = process_time() - start
-
-    # Convert the elapsed time into minutes, seconds
-    minutes = int(elapsed_time // 60)
-    seconds = round(elapsed_time % 60, 2)
-    
-    # Print the speed of the Code
+    elapsed = process_time() - start
+    minutes = int(elapsed // 60)
+    seconds = round(elapsed % 60, 2)
     print(f"{name} finished in {minutes} min {seconds} sec")
 
 
-def free_predictor():
-    global processor
-    processor = None
-    generate_masks.empty_cache()
-
-
-
-
-
+# ---------------------------------------------------------------------------
+# Operators — point/box prompt
+# ---------------------------------------------------------------------------
 
 class GenerateSingularMaskOperator(bpy.types.Operator):
-    """Generates a singular .png mask"""
+    """Generates a singular .png mask using point/box prompts"""
     bl_idname = "rotoforge.generate_singular_mask"
     bl_label = "Generate Mask"
     bl_options = {'REGISTER', 'UNDO'}
-    
+
     @classmethod
-    def poll(self, context):
-        if context.space_data.image is None:
-            return False
-        return True
+    def poll(cls, context):
+        return context.space_data.image is not None
 
     def execute(self, context):
         space = context.space_data
         mask = space.mask
         layer = mask.layers.active
         image = space.image
-        maskgencontrols = mask.rotoforge_maskgencontrols[layer.name]
+        props = mask.rotoforge_maskgencontrols[layer.name]
 
-        # Validate that user has drawn mask splines
         if len(layer.splines) == 0:
             self.report({'ERROR'}, 'No mask splines found! Please draw a mask first.')
             return {'CANCELLED'}
 
-        #Wake AI if not present
-        global processor
-        global used_model
+        try:
+            client = _ensure_server_and_model(context)
+        except RuntimeError as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
 
-        if processor == None or used_model != maskgencontrols.used_model:
-            # Start the timer
-            fetching = process_time()
-            used_model = maskgencontrols.used_model
-            processor = generate_masks.get_predictor()
-            time_checkpoint(fetching, 'Processor fetching')
-        
-        # Start the timer
         start = process_time()
 
-        #Get Prompt data to feed the machine god
         resolution = tuple(image.size)
         guide_mask = mask_rasterize.rasterize_layer_of_active_mask(layer, resolution)
         prompt_points, prompt_labels = prompt_utils.extract_prompt_points(mask, resolution)
         bounding_box = prompt_utils.calculate_bounding_box(guide_mask)
 
-        # check if we got any usable input
         if bounding_box is None and prompt_points is None:
             self.report({'ERROR'}, 'No valid mask input! The mask appears to be empty or invisible.')
             return {'CANCELLED'}
 
-        guide_strength = maskgencontrols.guide_strength
-        blur_radius = maskgencontrols.feather_radius
-        
         used_mask = f"{mask.name}/MaskLayers/{layer.name}"
-        
-        generate_masks.generate_mask(source_image = image, 
-                                     used_mask = used_mask, 
-                                     processor = processor, 
-                                     guide_mask = guide_mask, 
-                                     guide_strength = guide_strength,
-                                     blur_radius= blur_radius,
-                                     input_points = prompt_points,
-                                     input_labels = prompt_labels,
-                                     input_box = bounding_box,
-                                     debug_logits = False)
-        data_manager.update_maskseq(used_mask)
 
-        # Invalidate overlay cache since we generated a new mask
+        generate_masks.generate_mask(
+            source_image=image,
+            used_mask=used_mask,
+            client=client,
+            guide_mask=guide_mask,
+            guide_strength=props.guide_strength,
+            blur_radius=props.feather_radius,
+            input_points=prompt_points,
+            input_labels=prompt_labels,
+            input_box=bounding_box,
+        )
+        data_manager.update_maskseq(used_mask)
         overlay.invalidate_overlay_cache()
 
         self.report({'INFO'}, f'Saved mask layer as image: {used_mask}')
-
         time_checkpoint(start, 'Mask generation')
         return {'FINISHED'}
-    
+
     def invoke(self, context, event):
         if context.space_data.image.source in ['SEQUENCE', 'MOVIE']:
             wm = context.window_manager
-            return wm.invoke_confirm(self, event, title="This file is animated!", message="You're currently trying to create a static (not animated) mask based on animated footage. Do you wish to continue?", confirm_text="Process anyways", translate=True)
+            return wm.invoke_confirm(self, event, title="This file is animated!",
+                                     message="You're currently trying to create a static (not animated) mask based on animated footage. Do you wish to continue?",
+                                     confirm_text="Process anyways", translate=True)
         return self.execute(context)
 
 
+# ---------------------------------------------------------------------------
+# Operators — text prompt
+# ---------------------------------------------------------------------------
 
-class TrackMaskOperator(bpy.types.Operator):
-    """Tracks a mask"""
-    bl_idname = "rotoforge.track_mask"
-    bl_label = "Track Mask"
+class GenerateTextMaskOperator(bpy.types.Operator):
+    """Generates a mask using a text prompt (SAM3 concept segmentation)"""
+    bl_idname = "rotoforge.generate_text_mask"
+    bl_label = "Generate Text Mask"
     bl_options = {'REGISTER', 'UNDO'}
 
+    @classmethod
+    def poll(cls, context):
+        if context.space_data.image is None:
+            return False
+        space = context.space_data
+        if not (space.mask and space.mask.layers.active):
+            return False
+        props = space.mask.rotoforge_maskgencontrols[space.mask.layers.active.name]
+        return bool(props.text_prompt.strip())
+
+    def execute(self, context):
+        space = context.space_data
+        mask = space.mask
+        layer = mask.layers.active
+        image = space.image
+        props = mask.rotoforge_maskgencontrols[layer.name]
+
+        try:
+            client = _ensure_server_and_model(context)
+        except RuntimeError as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+        start = process_time()
+        multi_mode = props.text_multi_mode
+        used_mask = f"{mask.name}/MaskLayers/{layer.name}"
+
+        result = generate_masks.generate_mask_text(
+            source_image=image,
+            used_mask=used_mask,
+            client=client,
+            text_prompt=props.text_prompt.strip(),
+            blur_radius=props.feather_radius,
+            confidence_threshold=props.text_confidence,
+            multi_mode=multi_mode,
+        )
+
+        if multi_mode == 'separate' and len(result) > 0:
+            # Create a new layer for each detected instance
+            for i, instance_mask in enumerate(result):
+                layer_name = f"{layer.name}_{i+1}"
+                # Create the mask layer if it doesn't exist
+                if layer_name not in [l.name for l in mask.layers]:
+                    bpy.ops.mask.layer_new()
+                    mask.layers.active.name = layer_name
+
+                instance_path = f"{mask.name}/MaskLayers/{layer_name}"
+                from .data_manager import save_singular_mask as _save
+                _save(image, instance_path, instance_mask, None, props.feather_radius)
+                data_manager.update_maskseq(instance_path)
+
+            self.report({'INFO'}, f'Created {len(result)} instance layers from text prompt')
+        else:
+            data_manager.update_maskseq(used_mask)
+            count = len(result) if result else 0
+            self.report({'INFO'}, f'Saved text-prompted mask ({count} instance(s)): {used_mask}')
+
+        overlay.invalidate_overlay_cache()
+        time_checkpoint(start, 'Text mask generation')
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        if context.space_data.image.source in ['SEQUENCE', 'MOVIE']:
+            wm = context.window_manager
+            return wm.invoke_confirm(self, event, title="This file is animated!",
+                                     message="Creating a static mask on animated footage. Continue?",
+                                     confirm_text="Process anyways", translate=True)
+        return self.execute(context)
+
+
+class TrackTextMaskOperator(bpy.types.Operator):
+    """Tracks a mask using text prompts across frames"""
+    bl_idname = "rotoforge.track_text_mask"
+    bl_label = "Track Text Mask"
+    bl_options = {'REGISTER', 'UNDO'}
 
     _timer = None
     _next_processed_frame = None
     _used_mask_dir = None
     _running = False
 
-    #Prompt data for the machine god
-    guide_mask = None
-    prompt_points, prompt_labels = None, None
-    bounding_box = None
-
-
-    backwards: bpy.props.BoolProperty(
-        name="Backwards",
-        description="Tracks backwards",
-        default=False
-    ) # type: ignore
-
+    backwards: bpy.props.BoolProperty(name="Backwards", default=False)  # type: ignore
 
     @classmethod
-    def poll(self, context):
+    def poll(cls, context):
         if context.space_data.image is None:
             return False
         if context.space_data.image.source not in ['SEQUENCE', 'MOVIE']:
             return False
-        return True
+        space = context.space_data
+        if not (space.mask and space.mask.layers.active):
+            return False
+        props = space.mask.rotoforge_maskgencontrols[space.mask.layers.active.name]
+        return bool(props.text_prompt.strip())
 
     def modal(self, context, event):
         if event.type == 'TIMER':
-
             space = context.space_data
             mask = space.mask
             layer = mask.layers.active
             image = space.image
-            maskgencontrols = mask.rotoforge_maskgencontrols[layer.name]
+            props = mask.rotoforge_maskgencontrols[layer.name]
 
-            # Apply frame
             context.scene.frame_current = self._next_processed_frame
             space.image_user.frame_current = self._next_processed_frame
-
-            # Force-update the viewport for internal use
             space.display_channels = space.display_channels
 
+            print(f'----Info---- Frame: {self._next_processed_frame}')
 
-            print('----Info----')
-            print('Frame: ', str(self._next_processed_frame))
-
-
-            #Wake AI if not present
-            global processor
-            global used_model
-
-            if not maskgencontrols.tracking and self.prompt_points is None: # Run if tracking is disabled and it's not the 1st frame
-                #Get Prompt data to feed the machine god
-                resolution = tuple(image.size)
-                self.guide_mask = mask_rasterize.rasterize_layer_of_active_mask(layer, resolution)
-                self.prompt_points, self.prompt_labels = prompt_utils.extract_prompt_points(mask, resolution)
-                self.bounding_box = prompt_utils.calculate_bounding_box(self.guide_mask)
-
-
-            guide_strength = maskgencontrols.guide_strength
-            search_radius = maskgencontrols.search_radius
-            blur_radius = maskgencontrols.feather_radius
-
-            used_mask = self._used_mask_dir
-
-            self.guide_mask, self.bounding_box, overlay_l, _ = generate_masks.track_mask(source_image = image,
-                                                                                         used_mask = used_mask,
-                                                                                         processor = processor,
-                                                                                         guide_mask = self.guide_mask,
-                                                                                         guide_strength = guide_strength,
-                                                                                         blur_radius=blur_radius,
-                                                                                         search_radius = search_radius,
-                                                                                         input_points = self.prompt_points,
-                                                                                         input_labels = self.prompt_labels,
-                                                                                         input_box = self.bounding_box,
-                                                                                         input_logits = None)
-
-            # Check if tracking lost the mask (bounding box is None)
-            if self.bounding_box is None:
-                self.report({'WARNING'}, f'Tracking lost at frame {self._next_processed_frame}! Stopping.')
+            try:
+                client = _ensure_server_and_model(context)
+            except RuntimeError as e:
+                self.report({'ERROR'}, str(e))
                 self.cancel(context)
                 return {'CANCELLED'}
 
+            result = generate_masks.track_mask_text(
+                source_image=image,
+                used_mask=self._used_mask_dir,
+                client=client,
+                text_prompt=props.text_prompt.strip(),
+                blur_radius=props.feather_radius,
+                search_radius=props.search_radius,
+                confidence_threshold=props.text_confidence,
+                multi_mode=props.text_multi_mode,
+            )
+
+            if result[0] is None:
+                self.report({'WARNING'}, f'Text tracking lost at frame {self._next_processed_frame}! Stopping.')
+                self.cancel(context)
+                return {'CANCELLED'}
+
+            _, _, overlay_l = result
             overlay.rotoforge_overlay_shader.custom_img = overlay_l
 
-            self.prompt_points = None
-            self.prompt_labels = None
-
-            if not self.backwards:
-                endframe = mask.frame_end
-            else:
-                endframe = mask.frame_start
-
-            if self._next_processed_frame  == endframe:
+            endframe = mask.frame_end if not self.backwards else mask.frame_start
+            if self._next_processed_frame == endframe:
                 self.cancel(context)
-                return{'CANCELLED'}
-            else:
-                if not self.backwards: # Track last processed frame
-                    self._next_processed_frame += 1
-                else:
-                    self._next_processed_frame -= 1
-                return {'PASS_THROUGH'}
+                return {'CANCELLED'}
 
+            self._next_processed_frame += -1 if self.backwards else 1
+            return {'PASS_THROUGH'}
 
         if event.type in ['ESC', 'RIGHTMOUSE']:
             self.cancel(context)
@@ -238,86 +379,47 @@ class TrackMaskOperator(bpy.types.Operator):
         return {'PASS_THROUGH'}
 
     def execute(self, context):
-        if not self._running:
-            space = context.space_data
-            mask = space.mask
-            layer = mask.layers.active
-            image = space.image
-            maskgencontrols = mask.rotoforge_maskgencontrols[layer.name]
-
-            # Validate that user has drawn mask splines
-            if len(layer.splines) == 0:
-                self.report({'ERROR'}, 'No mask splines found! Please draw a mask first.')
-                return {'CANCELLED'}
-
-            #Wake AI if not present
-            global processor
-            global used_model
-
-            if processor == None or used_model != maskgencontrols.used_model:
-                used_model = maskgencontrols.used_model
-                processor = generate_masks.get_predictor()
-
-            #Get Prompt data to feed the machine god
-            resolution = tuple(image.size)
-            self.guide_mask = mask_rasterize.rasterize_layer_of_active_mask(layer, resolution)
-            self.prompt_points, self.prompt_labels = prompt_utils.extract_prompt_points(mask, resolution)
-            self.bounding_box = prompt_utils.calculate_bounding_box(self.guide_mask)
-
-            # check if we got any usable input
-            if self.bounding_box is None and self.prompt_points is None:
-                self.report({'ERROR'}, 'No valid mask input! The mask appears to be empty or invisible.')
-                return {'CANCELLED'}
-
-
-            # Get the folder to write to
-            used_mask = f"{mask.name}/MaskLayers/{layer.name}"
-            self._used_mask_dir = used_mask
-
-
-            self._next_processed_frame = context.scene.frame_current # Set last processed frame
-            self._running = True
-            context.window_manager.modal_handler_add(self)
-            self._timer = context.window_manager.event_timer_add(0.1, window=context.window)
-            return {'RUNNING_MODAL'}
-        else:
+        if self._running:
             return {'CANCELLED'}
 
-    def cancel(self, context):
+        space = context.space_data
+        mask = space.mask
+        layer = mask.layers.active
 
+        try:
+            _ensure_server_and_model(context)
+        except RuntimeError as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+        self._used_mask_dir = f"{mask.name}/MaskLayers/{layer.name}"
+        self._next_processed_frame = context.scene.frame_current
+        self._running = True
+        context.window_manager.modal_handler_add(self)
+        self._timer = context.window_manager.event_timer_add(0.1, window=context.window)
+        return {'RUNNING_MODAL'}
+
+    def cancel(self, context):
         context.window_manager.event_timer_remove(self._timer)
         self._running = False
-
         overlay.rotoforge_overlay_shader.custom_img = None
 
-        # Disable overlay before removing image to prevent concurrent access
         overlaycontrols = context.scene.rotoforge_overlaycontrols
         overlay_was_active = overlaycontrols.active_overlay
         overlaycontrols.active_overlay = False
-
-        # Force a redraw to ensure overlay handler releases the image
         context.area.tag_redraw()
 
-        # CRITICAL FIX: Remove ALL mask images before reloading
-        # Blender's movie cache becomes corrupted when image sequences are actively written
-        # The only safe solution is to completely remove and reload all mask images
         space = context.space_data
         mask = space.mask
 
-        # Collect all mask image names to remove
-        mask_images_to_remove = []
-        for image in bpy.data.images:
-            if image.source == 'SEQUENCE' and f"{mask.name}/MaskLayers/" in image.name:
-                mask_images_to_remove.append(image.name)
-
-        # Remove all mask layer images
+        mask_images_to_remove = [
+            img.name for img in bpy.data.images
+            if img.source == 'SEQUENCE' and f"{mask.name}/MaskLayers/" in img.name
+        ]
         for img_name in mask_images_to_remove:
             if img_name in bpy.data.images:
-                img = bpy.data.images[img_name]
-                bpy.data.images.remove(img, do_unlink=True)
+                bpy.data.images.remove(bpy.data.images[img_name], do_unlink=True)
 
-        # Reload all mask layer images that have directories on disk
-        # (only reload if the layer was actually tracked and has files)
         maskseq_dir = data_manager.get_rotoforge_dir('masksequences')
         for layer in mask.layers:
             layer_image_name = f"{mask.name}/MaskLayers/{layer.name}"
@@ -325,133 +427,390 @@ class TrackMaskOperator(bpy.types.Operator):
             if os.path.isdir(layer_dir):
                 data_manager.update_maskseq(layer_image_name)
 
-        # Restore overlay state
         overlaycontrols.active_overlay = overlay_was_active
-
-        # Invalidate overlay cache since we generated new masks
         overlay.invalidate_overlay_cache()
-
         overlaycontrols.used_mask = self._used_mask_dir
 
+        context.scene.frame_current = self._next_processed_frame
+        self.report({'INFO'}, f'Saved text-tracked mask sequence: {self._used_mask_dir}')
+        print("Quitting...")
 
-        # Stop on the last done frame
+
+# ---------------------------------------------------------------------------
+# Operators — point/box tracking
+# ---------------------------------------------------------------------------
+
+class TrackMaskOperator(bpy.types.Operator):
+    """Tracks a mask across frames using point/box prompts"""
+    bl_idname = "rotoforge.track_mask"
+    bl_label = "Track Mask"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    _timer = None
+    _next_processed_frame = None
+    _used_mask_dir = None
+    _running = False
+
+    guide_mask = None
+    prompt_points, prompt_labels = None, None
+    bounding_box = None
+
+    backwards: bpy.props.BoolProperty(name="Backwards", default=False)  # type: ignore
+
+    @classmethod
+    def poll(cls, context):
+        if context.space_data.image is None:
+            return False
+        return context.space_data.image.source in ['SEQUENCE', 'MOVIE']
+
+    def modal(self, context, event):
+        if event.type == 'TIMER':
+            space = context.space_data
+            mask = space.mask
+            layer = mask.layers.active
+            image = space.image
+            props = mask.rotoforge_maskgencontrols[layer.name]
+
+            context.scene.frame_current = self._next_processed_frame
+            space.image_user.frame_current = self._next_processed_frame
+            space.display_channels = space.display_channels
+
+            print(f'----Info---- Frame: {self._next_processed_frame}')
+
+            try:
+                client = _ensure_server_and_model(context)
+            except RuntimeError as e:
+                self.report({'ERROR'}, str(e))
+                self.cancel(context)
+                return {'CANCELLED'}
+
+            if not props.tracking and self.prompt_points is None:
+                resolution = tuple(image.size)
+                self.guide_mask = mask_rasterize.rasterize_layer_of_active_mask(layer, resolution)
+                self.prompt_points, self.prompt_labels = prompt_utils.extract_prompt_points(mask, resolution)
+                self.bounding_box = prompt_utils.calculate_bounding_box(self.guide_mask)
+
+            self.guide_mask, self.bounding_box, overlay_l, _ = generate_masks.track_mask(
+                source_image=image,
+                used_mask=self._used_mask_dir,
+                client=client,
+                guide_mask=self.guide_mask,
+                guide_strength=props.guide_strength,
+                blur_radius=props.feather_radius,
+                search_radius=props.search_radius,
+                input_points=self.prompt_points,
+                input_labels=self.prompt_labels,
+                input_box=self.bounding_box,
+            )
+
+            if self.bounding_box is None:
+                self.report({'WARNING'}, f'Tracking lost at frame {self._next_processed_frame}! Stopping.')
+                self.cancel(context)
+                return {'CANCELLED'}
+
+            overlay.rotoforge_overlay_shader.custom_img = overlay_l
+            self.prompt_points = None
+            self.prompt_labels = None
+
+            endframe = mask.frame_end if not self.backwards else mask.frame_start
+            if self._next_processed_frame == endframe:
+                self.cancel(context)
+                return {'CANCELLED'}
+
+            self._next_processed_frame += -1 if self.backwards else 1
+            return {'PASS_THROUGH'}
+
+        if event.type in ['ESC', 'RIGHTMOUSE']:
+            self.cancel(context)
+            return {'CANCELLED'}
+
+        return {'PASS_THROUGH'}
+
+    def execute(self, context):
+        if self._running:
+            return {'CANCELLED'}
+
+        space = context.space_data
+        mask = space.mask
+        layer = mask.layers.active
+        image = space.image
+        props = mask.rotoforge_maskgencontrols[layer.name]
+
+        if len(layer.splines) == 0:
+            self.report({'ERROR'}, 'No mask splines found! Please draw a mask first.')
+            return {'CANCELLED'}
+
+        try:
+            client = _ensure_server_and_model(context)
+        except RuntimeError as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+        resolution = tuple(image.size)
+        self.guide_mask = mask_rasterize.rasterize_layer_of_active_mask(layer, resolution)
+        self.prompt_points, self.prompt_labels = prompt_utils.extract_prompt_points(mask, resolution)
+        self.bounding_box = prompt_utils.calculate_bounding_box(self.guide_mask)
+
+        if self.bounding_box is None and self.prompt_points is None:
+            self.report({'ERROR'}, 'No valid mask input! The mask appears to be empty or invisible.')
+            return {'CANCELLED'}
+
+        self._used_mask_dir = f"{mask.name}/MaskLayers/{layer.name}"
+        self._next_processed_frame = context.scene.frame_current
+        self._running = True
+        context.window_manager.modal_handler_add(self)
+        self._timer = context.window_manager.event_timer_add(0.1, window=context.window)
+        return {'RUNNING_MODAL'}
+
+    def cancel(self, context):
+        context.window_manager.event_timer_remove(self._timer)
+        self._running = False
+
+        overlay.rotoforge_overlay_shader.custom_img = None
+
+        overlaycontrols = context.scene.rotoforge_overlaycontrols
+        overlay_was_active = overlaycontrols.active_overlay
+        overlaycontrols.active_overlay = False
+        context.area.tag_redraw()
+
+        space = context.space_data
+        mask = space.mask
+
+        mask_images_to_remove = [
+            img.name for img in bpy.data.images
+            if img.source == 'SEQUENCE' and f"{mask.name}/MaskLayers/" in img.name
+        ]
+        for img_name in mask_images_to_remove:
+            if img_name in bpy.data.images:
+                bpy.data.images.remove(bpy.data.images[img_name], do_unlink=True)
+
+        maskseq_dir = data_manager.get_rotoforge_dir('masksequences')
+        for layer in mask.layers:
+            layer_image_name = f"{mask.name}/MaskLayers/{layer.name}"
+            layer_dir = os.path.join(maskseq_dir, layer_image_name)
+            if os.path.isdir(layer_dir):
+                data_manager.update_maskseq(layer_image_name)
+
+        overlaycontrols.active_overlay = overlay_was_active
+        overlay.invalidate_overlay_cache()
+        overlaycontrols.used_mask = self._used_mask_dir
+
         context.scene.frame_current = self._next_processed_frame
 
-        # Release prompt data
         self.guide_mask = None
         self.prompt_points, self.prompt_labels = None, None
         self.bounding_box = None
 
         self.report({'INFO'}, f'Saved mask layer as image sequence: {self._used_mask_dir}')
         print("Quitting...")
-        
-        
+
+
+# ---------------------------------------------------------------------------
+# Operators — video tracking (SAM3 native temporal tracking)
+# ---------------------------------------------------------------------------
+
+class TrackVideoTextOperator(bpy.types.Operator):
+    """Track with text prompt using SAM3 video predictor (temporal memory, all frames at once)"""
+    bl_idname = "rotoforge.track_video_text"
+    bl_label = "Video Track (Text)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        if context.space_data.image is None:
+            return False
+        if context.space_data.image.source not in ['SEQUENCE', 'MOVIE']:
+            return False
+        space = context.space_data
+        if not (space.mask and space.mask.layers.active):
+            return False
+        props = space.mask.rotoforge_maskgencontrols[space.mask.layers.active.name]
+        return bool(props.text_prompt.strip())
+
+    def execute(self, context):
+        space = context.space_data
+        mask = space.mask
+        layer = mask.layers.active
+        image = space.image
+        props = mask.rotoforge_maskgencontrols[layer.name]
+
+        try:
+            client = _ensure_server_and_model(context)
+        except RuntimeError as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+        start = process_time()
+        used_mask = f"{mask.name}/MaskLayers/{layer.name}"
+
+        saved = generate_masks.track_video_text(
+            source_image=image,
+            used_mask=used_mask,
+            client=client,
+            text_prompt=props.text_prompt.strip(),
+            frame_start=mask.frame_start,
+            frame_end=mask.frame_end,
+            prompt_frame=context.scene.frame_current,
+            blur_radius=props.feather_radius,
+            confidence_threshold=props.text_confidence,
+            direction="both",
+        )
+
+        # Reload mask sequence
+        if used_mask in bpy.data.images:
+            bpy.data.images.remove(bpy.data.images[used_mask], do_unlink=True)
+        data_manager.update_maskseq(used_mask)
+        overlay.invalidate_overlay_cache()
+
+        self.report({'INFO'}, f'Video tracked {saved} frames with text prompt: {used_mask}')
+        time_checkpoint(start, 'Video text tracking')
+        return {'FINISHED'}
+
+
+class TrackVideoPointsOperator(bpy.types.Operator):
+    """Track with point/box prompt using SAM3 video predictor (temporal memory, all frames at once)"""
+    bl_idname = "rotoforge.track_video_points"
+    bl_label = "Video Track (Points)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        if context.space_data.image is None:
+            return False
+        return context.space_data.image.source in ['SEQUENCE', 'MOVIE']
+
+    def execute(self, context):
+        space = context.space_data
+        mask = space.mask
+        layer = mask.layers.active
+        image = space.image
+        props = mask.rotoforge_maskgencontrols[layer.name]
+
+        if len(layer.splines) == 0:
+            self.report({'ERROR'}, 'No mask splines found! Please draw a mask first.')
+            return {'CANCELLED'}
+
+        try:
+            client = _ensure_server_and_model(context)
+        except RuntimeError as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+        start = process_time()
+        resolution = tuple(image.size)
+        prompt_points, prompt_labels = prompt_utils.extract_prompt_points(mask, resolution)
+
+        if prompt_points is None:
+            self.report({'ERROR'}, 'No valid prompt points found.')
+            return {'CANCELLED'}
+
+        used_mask = f"{mask.name}/MaskLayers/{layer.name}"
+
+        saved = generate_masks.track_video_points(
+            source_image=image,
+            used_mask=used_mask,
+            client=client,
+            frame_start=mask.frame_start,
+            frame_end=mask.frame_end,
+            prompt_frame=context.scene.frame_current,
+            input_points=prompt_points,
+            input_labels=prompt_labels,
+            blur_radius=props.feather_radius,
+            direction="both",
+        )
+
+        if used_mask in bpy.data.images:
+            bpy.data.images.remove(bpy.data.images[used_mask], do_unlink=True)
+        data_manager.update_maskseq(used_mask)
+        overlay.invalidate_overlay_cache()
+
+        self.report({'INFO'}, f'Video tracked {saved} frames with point prompt: {used_mask}')
+        time_checkpoint(start, 'Video point tracking')
+        return {'FINISHED'}
+
+
+# ---------------------------------------------------------------------------
+# Operators — merge / import / misc
+# ---------------------------------------------------------------------------
 
 class MergeMaskOperator(bpy.types.Operator):
     """Rasterizes all masks down to image"""
     bl_idname = "rotoforge.merge_mask"
     bl_label = "Bake Mask to Texture"
     bl_options = {'REGISTER', 'UNDO'}
-    
+
     _timer = None
     _next_processed_frame = None
     _used_mask_dir = None
     _running = False
-    
+
     @classmethod
-    def poll(self, context):
-        if context.space_data.image is None:
-            return False
-        return True
-    
+    def poll(cls, context):
+        return context.space_data.image is not None
+
     def modal(self, context, event):
         if event.type == 'TIMER':
-            
             space = context.space_data
             mask = space.mask
             image = space.image
-            
-            # Apply frame
-            context.scene.frame_current = self._next_processed_frame 
+
+            context.scene.frame_current = self._next_processed_frame
             space.image_user.frame_current = self._next_processed_frame
 
-            print('----Info----')
-            print('Frame: ', str(self._next_processed_frame))
+            print(f'----Info---- Frame: {self._next_processed_frame}')
 
-            used_mask = self._used_mask_dir
             img = mask_rasterize.rasterize_active_mask()
             overlay.rotoforge_overlay_shader.custom_img = img
-            data_manager.save_sequential_mask(image, used_mask, img, None)
-            
-            if self._next_processed_frame  == mask.frame_end:
+            data_manager.save_sequential_mask(image, self._used_mask_dir, img, None)
+
+            if self._next_processed_frame == mask.frame_end:
                 self.cancel(context)
-                return{'CANCELLED'}
-            else:
-                self._next_processed_frame += 1
-                return {'PASS_THROUGH'}
-        
-        
+                return {'CANCELLED'}
+
+            self._next_processed_frame += 1
+            return {'PASS_THROUGH'}
+
         if event.type in ['ESC', 'RIGHTMOUSE']:
             self.cancel(context)
             return {'CANCELLED'}
-        
+
         return {'PASS_THROUGH'}
 
     def execute(self, context):
-        if not self._running:
-            space = context.space_data
-            mask = space.mask
-            image = space.image
-
-            #Get Prompt data to feed the machine god
-            self.resolution = tuple(image.size)
-
-            
-            # Get the folder to write to
-            used_mask = f"{mask.name}/Combined"
-            self._used_mask_dir = used_mask
-            
-            self._next_processed_frame = mask.frame_start # Set last processed frame
-            self._running = True
-            context.window_manager.modal_handler_add(self)
-            self._timer = context.window_manager.event_timer_add(0.1, window=context.window)
-            return {'RUNNING_MODAL'}
-        else:
+        if self._running:
             return {'CANCELLED'}
-    
-    def cancel(self, context):
 
+        _ensure_modules()
+
+        space = context.space_data
+        mask = space.mask
+
+        self._used_mask_dir = f"{mask.name}/Combined"
+        self._next_processed_frame = mask.frame_start
+        self._running = True
+        context.window_manager.modal_handler_add(self)
+        self._timer = context.window_manager.event_timer_add(0.1, window=context.window)
+        return {'RUNNING_MODAL'}
+
+    def cancel(self, context):
         context.window_manager.event_timer_remove(self._timer)
         self._running = False
 
         overlay.rotoforge_overlay_shader.custom_img = None
 
-        # CRITICAL FIX: Remove Combined mask image before reloading
-        # Same movie cache issue as layer masks
         if self._used_mask_dir in bpy.data.images:
             img = bpy.data.images[self._used_mask_dir]
             bpy.data.images.remove(img, do_unlink=True)
 
-        # Now reload with fresh cache
         data_manager.update_maskseq(self._used_mask_dir)
-
-        # Invalidate overlay cache since we generated new masks
         overlay.invalidate_overlay_cache()
 
         overlaycontrols = context.scene.rotoforge_overlaycontrols
         overlaycontrols.used_mask = self._used_mask_dir
 
-
-        # Stop on the last done frame
         context.scene.frame_current = self._next_processed_frame
-
-        # Release prompt data
-        self.resolution = None
-        self.tracking = None
-
         self.report({'INFO'}, f'Saved combined mask as image sequence: {self._used_mask_dir}')
         print("Quitting...")
-
 
 
 class ImportMaskNodeOperator(bpy.types.Operator):
@@ -459,34 +818,26 @@ class ImportMaskNodeOperator(bpy.types.Operator):
     bl_idname = "rotoforge.import_mask_node"
     bl_label = "Import Mask"
     bl_options = {'REGISTER', 'UNDO'}
-    
-    mouse_pos = (0,0)
-    
+
+    mouse_pos = (0, 0)
+
     @classmethod
-    def poll(self, context):
+    def poll(cls, context):
         used_mask = context.scene.rotoforge_importcontrols.used_mask
-        if context.space_data.node_tree is None or used_mask in ('', 'NONE'):
-            return False
-        return True
+        return context.space_data.node_tree is not None and used_mask not in ('', 'NONE')
 
     def invoke(self, context, event):
         self.mouse_pos = (event.mouse_region_x, event.mouse_region_y)
         return self.execute(context)
-    
+
     def execute(self, context):
-        # Error for non-existent node-tree
         nodetree = context.space_data.node_tree
         import_props = context.scene.rotoforge_importcontrols
         region = context.region
         view2d = region.view2d
 
-        # Get info
-        def get_selected(nodetree):
-            select = False
-            for node in nodetree.nodes:
-                if select == False:
-                    select = node.select
-            return select
+        def get_selected(nt):
+            return any(node.select for node in nt.nodes)
 
         bpy.ops.node.select_all(action='DESELECT')
         while get_selected(nodetree) and nodetree.nodes.active and nodetree.nodes.active.type == 'GROUP':
@@ -495,9 +846,7 @@ class ImportMaskNodeOperator(bpy.types.Operator):
         used_mask = bpy.data.masks[import_props.used_mask]
         used_mask_img = bpy.data.images[f"{import_props.used_mask}/Combined"]
 
-        # Add node
         nodetree_type = nodetree.type
-        
         match nodetree_type:
             case 'COMPOSITING':
                 bpy.ops.node.add_node(type='CompositorNodeImage')
@@ -521,13 +870,10 @@ class ImportMaskNodeOperator(bpy.types.Operator):
         ui_scale = context.preferences.system.ui_scale
         x, y = view2d.region_to_view(self.mouse_pos[0], self.mouse_pos[1])
         node.location = x / ui_scale, y / ui_scale
-        
-        # Make the node stick to the cursor
         bpy.ops.node.translate_attach_remove_on_cancel('INVOKE_DEFAULT')
-        
+
         self.report({'INFO'}, f'Created new image node linked to mask: {import_props.used_mask}')
         return {'FINISHED'}
-
 
 
 class MaskRangeToSceneOperator(bpy.types.Operator):
@@ -535,7 +881,6 @@ class MaskRangeToSceneOperator(bpy.types.Operator):
     bl_idname = "rotoforge.set_mask_range_to_scene"
     bl_label = "Set Scene Frames"
     bl_options = {'REGISTER', 'UNDO'}
-    
 
     def execute(self, context):
         scene = context.scene
@@ -545,19 +890,32 @@ class MaskRangeToSceneOperator(bpy.types.Operator):
         return {'FINISHED'}
 
 
-
 class FreePredictorOperator(bpy.types.Operator):
-    """Frees the predictor from GPU memory"""
+    """Frees the model from GPU memory (keeps server running)"""
     bl_idname = "rotoforge.free_predictor"
     bl_label = "Free Cache"
     bl_options = {'REGISTER', 'UNDO'}
-    
 
     def execute(self, context):
-        free_predictor()
+        free_server()
         return {'FINISHED'}
 
 
+class StopServerOperator(bpy.types.Operator):
+    """Stop the SAM3 inference server"""
+    bl_idname = "rotoforge.stop_server"
+    bl_label = "Stop Server"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        stop_server()
+        self.report({'INFO'}, 'SAM3 server stopped')
+        return {'FINISHED'}
+
+
+# ---------------------------------------------------------------------------
+# Panels
+# ---------------------------------------------------------------------------
 
 class LayerPanel(bpy.types.Panel):
     """Mask Layers"""
@@ -588,46 +946,33 @@ class LayerPanel(bpy.types.Panel):
         sub.prop(mask, "frame_start", text="Start")
         sub.prop(mask, "frame_end", text="End")
         layout.operator("rotoforge.merge_mask", icon='RENDER_RESULT')
-        
-        rows = 4 if active_layer else 1
 
+        rows = 4 if active_layer else 1
         row = layout.row()
-        row.template_list(
-            "MASK_UL_layers", "", mask, "layers",
-            mask, "active_layer_index", rows=rows,
-        )
+        row.template_list("MASK_UL_layers", "", mask, "layers", mask, "active_layer_index", rows=rows)
 
         sub = row.column(align=True)
-
         sub.operator("mask.layer_new", icon='ADD', text="")
         sub.operator("mask.layer_remove", icon='REMOVE', text="")
 
         if active_layer:
             rotoforge_props = mask.rotoforge_maskgencontrols[active_layer.name]
             sub.separator()
-            
             sub.operator("mask.layer_move", icon='TRIA_UP', text="").direction = 'UP'
             sub.operator("mask.layer_move", icon='TRIA_DOWN', text="").direction = 'DOWN'
 
-            # blending
             row = layout.row(align=True)
             row.prop(active_layer, "alpha")
             row.prop(active_layer, "invert", text="", icon='IMAGE_ALPHA')
-            
             layout.prop(active_layer, "blend")
-            
-            # RotoForge layer
+
             layout.prop(rotoforge_props, "is_rflayer")
             layout.separator()
-            if rotoforge_props.is_rflayer:
-                pass
-            else:
+            if not rotoforge_props.is_rflayer:
                 layout.prop(active_layer, "falloff")
-                
                 col = layout.column()
                 col.prop(active_layer, "use_fill_overlap", text="Overlap")
                 col.prop(active_layer, "use_fill_holes", text="Holes")
-
 
 
 class RotoForgeMaskPanel(bpy.types.Panel):
@@ -637,86 +982,105 @@ class RotoForgeMaskPanel(bpy.types.Panel):
     bl_space_type = 'IMAGE_EDITOR'
     bl_region_type = 'UI'
     bl_category = "RotoForge"
-    
+
     @classmethod
     def poll(cls, context):
         space_data = context.space_data
-        if (space_data.mask) and (space_data.mask.layers.active is not None) and (space_data.mode == 'MASK'):
+        if space_data.mask and space_data.mask.layers.active is not None and space_data.mode == 'MASK':
             mask = space_data.mask
             active_layer = mask.layers.active
-            is_rflayer = mask.rotoforge_maskgencontrols[active_layer.name].is_rflayer
-            return is_rflayer
+            return mask.rotoforge_maskgencontrols[active_layer.name].is_rflayer
         return False
-    
+
     def draw(self, context):
         layout = self.layout
         space_data = context.space_data
         mask = space_data.mask
         active_layer = mask.layers.active
-        rotoforge_props = mask.rotoforge_maskgencontrols[active_layer.name]
-        
-        
+        props = mask.rotoforge_maskgencontrols[active_layer.name]
+
         # Global Settings
         global_settings = layout.box()
         global_settings.label(text="Global Settings")
-        global_settings.prop(rotoforge_props, "used_model")
-        global_settings.prop(rotoforge_props, "guide_strength")
-        global_settings.prop(rotoforge_props, "feather_radius")
+        global_settings.prop(props, "used_model")
+        global_settings.prop(props, "guide_strength")
+        global_settings.prop(props, "feather_radius")
         layout.separator()
-        
-        
-        # Tracking Settings
+
+        # Text Prompt
+        text_box = layout.box()
+        text_box.label(text="Text Prompt (SAM3)")
+        text_box.prop(props, "text_prompt", text="")
+        row = text_box.row(align=True)
+        row.prop(props, "text_confidence")
+        row.prop(props, "text_multi_mode", text="")
+
+        row = text_box.row(align=True)
+        row.label(text="Static:")
+        row = row.row(align=True)
+        row.alignment = 'RIGHT'
+        row.operator("rotoforge.generate_text_mask", text="Generate", icon='SORTALPHA')
+
+        row = text_box.row(align=True)
+        row.label(text="Animated:")
+        row.scale_x = 2.0
+        op = row.operator("rotoforge.track_text_mask", text="", icon='TRACKING_BACKWARDS')
+        op.backwards = True
+        op = row.operator("rotoforge.track_text_mask", text="", icon='TRACKING_FORWARDS')
+        op.backwards = False
+
+        text_box.operator("rotoforge.track_video_text", text="Video Track (All Frames)", icon='SEQUENCE')
+        layout.separator()
+
+        # Tracking Settings (point/box)
         tracking_settings = layout.box()
-        tracking_settings.label(text="Tracking Settings")
-        tracking_settings.prop(rotoforge_props, "tracking")
-        tracking_settings.prop(rotoforge_props, "search_radius")
+        tracking_settings.label(text="Point/Box Tracking Settings")
+        tracking_settings.prop(props, "tracking")
+        tracking_settings.prop(props, "search_radius")
         layout.separator()
-        
-        
-        # Generation buttons
+
+        # Point/Box Generation
         box = layout.box()
-        box.label(text="Generation")
-        #   Static Mask
+        box.label(text="Point/Box Generation")
         row = box.row(align=True)
         row.label(text="Static:")
         row = row.row(align=True)
         row.alignment = 'RIGHT'
-        op = row.operator("rotoforge.generate_singular_mask", text="Generate", icon='IMAGE_PLANE')
-        #   Animated Mask
+        row.operator("rotoforge.generate_singular_mask", text="Generate", icon='IMAGE_PLANE')
+
         row = box.row(align=True)
         row.label(text="Animated:")
         row.scale_x = 2.0
-        op = row.operator("rotoforge.track_mask", text="", icon='TRACKING_BACKWARDS')
+        op = box.operator("rotoforge.track_mask", text="", icon='TRACKING_BACKWARDS')
         op.backwards = True
-        op = row.operator("rotoforge.track_mask", text="", icon='TRACKING_FORWARDS')
+        op = box.operator("rotoforge.track_mask", text="", icon='TRACKING_FORWARDS')
         op.backwards = False
-        
+
+        box.operator("rotoforge.track_video_points", text="Video Track (All Frames)", icon='SEQUENCE')
         layout.separator()
-        
-        
+
         # Active Spline Settings
         spline_settings = layout.box()
         spline_settings.label(text="Active Spline Settings")
-        
+
         if hasattr(active_layer, 'splines'):
             active_mask_spline = context.edit_mask.layers.active.splines.active
         else:
             active_mask_spline = None
-        
+
         if active_mask_spline is not None:
-            spline_settings.prop(active_mask_spline, "use_cyclic", text="🗹Boundary|🗷Prompt points")
+            spline_settings.prop(active_mask_spline, "use_cyclic", text="\u2611Boundary|\u2610Prompt points")
             if not active_mask_spline.use_cyclic:
-                spline_settings.prop(active_mask_spline, "use_fill", text="🗹Mask|🗷Background")
+                spline_settings.prop(active_mask_spline, "use_fill", text="\u2611Mask|\u2610Background")
         else:
             spline_settings.label(text="No active spline detected")
         layout.separator()
-        
-        
-        # Free Cache button
-        layout.operator("rotoforge.resync_masksequence", icon='FILE_REFRESH')
-        layout.operator("rotoforge.free_predictor", text="Free Cache", icon='TRASH')
-        layout.separator()
 
+        # Server / cache controls
+        layout.operator("rotoforge.resync_masksequence", icon='FILE_REFRESH')
+        layout.operator("rotoforge.free_predictor", text="Free GPU Cache", icon='TRASH')
+        layout.operator("rotoforge.stop_server", text="Stop Server", icon='CANCEL')
+        layout.separator()
 
 
 class NodeImportControls(bpy.types.PropertyGroup):
@@ -726,27 +1090,22 @@ class NodeImportControls(bpy.types.PropertyGroup):
             image_name = f"{mask.name}/Combined"
             if image_name in bpy.data.images:
                 possible_mask.append(mask.name)
-
-        # Return placeholder if no masks are available to avoid enum warning
         if len(possible_mask) < 1:
             return [('NONE', 'No baked masks available', 'Please bake a mask first using "Bake Mask to Texture"')]
-
         return [(element, element, f'Import the mask "{element}"') for element in possible_mask]
-    
-    used_mask : bpy.props.EnumProperty(
-        name="Used Mask",
-        items=update_mask_options
-    ) # type: ignore
-    
-    @classmethod 
+
+    used_mask: bpy.props.EnumProperty(name="Used Mask", items=update_mask_options)  # type: ignore
+
+    @classmethod
     def register(cls):
         bpy.types.Scene.rotoforge_importcontrols = bpy.props.PointerProperty(type=cls)
-    
+
     @classmethod
     def unregister(cls):
         if hasattr(bpy.types.Scene, 'rotoforge_importcontrols'):
             del bpy.types.Scene.rotoforge_importcontrols
-    
+
+
 class RotoForgeNodePanel(bpy.types.Panel):
     """RotoForge Node Panel"""
     bl_label = "RotoForge"
@@ -755,42 +1114,48 @@ class RotoForgeNodePanel(bpy.types.Panel):
     bl_region_type = 'UI'
     bl_category = "RotoForge"
     bl_context = "node_editor"
-    
+
     def draw(self, context):
         layout = self.layout
-        space_data = context.space_data
         import_props = bpy.context.scene.rotoforge_importcontrols
-        
         layout.prop(import_props, 'used_mask')
         layout.operator('rotoforge.import_mask_node')
 
 
+# ---------------------------------------------------------------------------
+# Registration
+# ---------------------------------------------------------------------------
 
+classes = [
+    NodeImportControls,
+    GenerateSingularMaskOperator,
+    GenerateTextMaskOperator,
+    TrackMaskOperator,
+    TrackTextMaskOperator,
+    TrackVideoTextOperator,
+    TrackVideoPointsOperator,
+    MergeMaskOperator,
+    ImportMaskNodeOperator,
+    MaskRangeToSceneOperator,
+    FreePredictorOperator,
+    StopServerOperator,
+    LayerPanel,
+    RotoForgeMaskPanel,
+    RotoForgeNodePanel,
+]
 
-
-classes = [NodeImportControls,
-           GenerateSingularMaskOperator,
-           TrackMaskOperator,
-           MergeMaskOperator,
-           ImportMaskNodeOperator,
-           MaskRangeToSceneOperator,
-           FreePredictorOperator,
-           LayerPanel,
-           RotoForgeMaskPanel,
-           RotoForgeNodePanel
-           ]
 
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
-        
     return {'REGISTERED'}
 
+
 def unregister():
+    stop_server()
     for cls in classes:
         try:
             bpy.utils.unregister_class(cls)
         except RuntimeError:
             pass
-        
     return {'UNREGISTERED'}

@@ -1,0 +1,26 @@
+# RotoForge AI - SAM3 Server Dependencies
+# Installed into the separate Python 3.12+ venv, NOT into Blender's Python.
+
+setuptools
+torch>=2.6.0
+torchvision>=0.21.0
+
+# SAM3 from source
+git+https://github.com/facebookresearch/sam3.git
+
+# SAM3's own dependencies (most are pulled transitively, but pin key ones)
+timm>=1.0.17
+huggingface_hub
+numpy>=1.26,<2
+Pillow
+einops
+tqdm
+ftfy==6.1.1
+regex
+iopath>=0.1.10
+pycocotools
+psutil
+
+
+# Optional: decord (for MP4 video input — not needed since we use JPEG directories)
+# pip install decord  # Only if you need direct MP4 loading

@@ -1,4 +1,3 @@
-# SAM3 constraints
---extra-index-url https://download.pytorch.org/whl/cu126
-torch == 2.7.0
-torchvision == 0.22.0
+# RotoForge AI - Blender-side constraints
+# No heavy dependencies needed on the Blender side.
+# torch, sam3, triton, etc. are installed in the server venv.
