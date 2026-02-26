@@ -340,30 +340,53 @@ class SAM3Client:
         }
 
     def video_propagate(self, session_id: str, direction="both",
-                        fill_hole_area=16):
+                        fill_hole_area=16, progress_callback=None):
         """Propagate tracking across all video frames.
 
         Args:
             session_id: active session.
             direction: "forward", "backward", or "both".
             fill_hole_area: pixel area threshold for hole filling (0 = disabled).
+            progress_callback: optional callable(frames_done: int) called as
+                each frame result arrives from the server stream.
 
         Returns:
             dict mapping frame_index (int) → {"masks": [np arrays], "obj_ids": [ints]}.
         """
-        resp = self._request("POST", "/video/propagate",
-                             {"session_id": session_id, "direction": direction,
-                              "fill_hole_area": fill_hole_area},
-                             timeout=600)
+        url = self.base_url + "/video/propagate"
+        payload = json.dumps({
+            "session_id": session_id,
+            "direction": direction,
+            "fill_hole_area": fill_hole_area,
+        }).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        req = urllib.request.Request(url, data=payload, headers=headers,
+                                     method="POST")
 
         results = {}
-        for frame_key, frame_data in resp.items():
-            frame_idx = int(frame_key)
-            masks = [b64_to_ndarray(m) for m in frame_data["masks"]] if frame_data.get("masks") else []
-            results[frame_idx] = {
-                "masks": masks,
-                "obj_ids": frame_data.get("obj_ids", []),
-            }
+        try:
+            with urllib.request.urlopen(req, timeout=600) as resp:
+                for raw_line in resp:
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    frame_data = json.loads(line)
+                    frame_idx = int(frame_data["frame_idx"])
+                    masks = ([b64_to_ndarray(m) for m in frame_data["masks"]]
+                             if frame_data.get("masks") else [])
+                    results[frame_idx] = {
+                        "masks": masks,
+                        "obj_ids": frame_data.get("obj_ids", []),
+                    }
+                    if progress_callback:
+                        progress_callback(len(results))
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"SAM3 server error {e.code}: {error_body}") from e
+        except urllib.error.URLError as e:
+            raise ConnectionError(
+                f"Cannot reach SAM3 server at {url}: {e}") from e
+
         return results
 
     def video_close_session(self, session_id: str):

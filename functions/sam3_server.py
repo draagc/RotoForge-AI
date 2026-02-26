@@ -426,6 +426,17 @@ class SAM3Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         return self.rfile.read(length)
 
+    def _start_ndjson(self):
+        """Begin a streaming NDJSON response (one JSON object per line)."""
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.end_headers()
+
+    def _send_ndjson_line(self, obj):
+        """Write a single JSON line and flush immediately."""
+        self.wfile.write(json.dumps(obj).encode("utf-8") + b"\n")
+        self.wfile.flush()
+
     def log_message(self, format, *args):
         pass
 
@@ -614,20 +625,43 @@ class SAM3Handler(BaseHTTPRequestHandler):
         data = self._read_json()
         direction = data.get("direction", "both")
         fill_hole_area = data.get("fill_hole_area", 16)
+        session_id = data["session_id"]
+
+        self._start_ndjson()
 
         with _lock:
-            results = video_propagate(data["session_id"], direction,
-                                      fill_hole_area=fill_hole_area)
+            if _video_predictor is not None and hasattr(_video_predictor, 'model'):
+                _video_predictor.model.fill_hole_area = fill_hole_area
 
-        resp = {}
-        for frame_idx, frame_data in results.items():
-            encoded_masks = [ndarray_to_b64(m) for m in frame_data["masks"]]
-            resp[str(frame_idx)] = {
-                "masks": encoded_masks,
-                "obj_ids": frame_data["obj_ids"],
-            }
+            count = 0
+            for frame_result in _video_predictor.handle_stream_request(dict(
+                type="propagate_in_video",
+                session_id=session_id,
+                propagation_direction=direction,
+            )):
+                frame_idx = frame_result.get("frame_index")
+                outputs = frame_result.get("outputs", {})
 
-        self._send_json(200, resp)
+                frame_masks = []
+                frame_obj_ids = []
+                if "out_binary_masks" in outputs:
+                    for i, obj in enumerate(outputs.get("out_obj_ids", [])):
+                        mask = outputs["out_binary_masks"][i]
+                        if hasattr(mask, 'cpu'):
+                            mask = mask.cpu().numpy()
+                        frame_masks.append(np.asarray(mask, dtype=bool))
+                        frame_obj_ids.append(int(obj))
+
+                self._send_ndjson_line({
+                    "frame_idx": frame_idx,
+                    "masks": [ndarray_to_b64(m) for m in frame_masks],
+                    "obj_ids": frame_obj_ids,
+                })
+                count += 1
+
+            empty_cache()
+
+        print(f"[sam3_server] Streamed {count} propagated frames")
 
     def _handle_video_close(self):
         if _video_predictor is None:

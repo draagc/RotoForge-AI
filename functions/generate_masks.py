@@ -487,11 +487,18 @@ def server_track_video_text(
             return 0
 
         n_obj = len(result["obj_ids"])
+        total_frames = len(frame_to_idx)
         print(f'Detected {n_obj} object(s), propagating {direction}...')
         if status_callback:
-            status_callback(f"Propagating ({n_obj} objects)...")
+            status_callback(f"Propagating 0/{total_frames}...")
+
+        def _prop_progress(done):
+            if status_callback:
+                status_callback(f"Propagating {done}/{total_frames}...")
+
         all_frames = client.video_propagate(session_id, direction=direction,
-                                            fill_hole_area=fill_hole_area)
+                                            fill_hole_area=fill_hole_area,
+                                            progress_callback=_prop_progress)
 
         return _save_propagated_masks(
             all_frames, idx_to_frame, used_mask,
@@ -597,11 +604,18 @@ def server_track_video_points(
             print('No objects detected for point prompt on the initial frame')
             return 0
 
+        total_frames = len(frame_to_idx)
         print(f'Propagating {direction}...')
         if status_callback:
-            status_callback("Propagating...")
+            status_callback(f"Propagating 0/{total_frames}...")
+
+        def _prop_progress(done):
+            if status_callback:
+                status_callback(f"Propagating {done}/{total_frames}...")
+
         all_frames = client.video_propagate(session_id, direction=direction,
-                                            fill_hole_area=fill_hole_area)
+                                            fill_hole_area=fill_hole_area,
+                                            progress_callback=_prop_progress)
 
         return _save_propagated_masks(
             all_frames, idx_to_frame, used_mask,
