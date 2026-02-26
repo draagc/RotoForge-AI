@@ -319,6 +319,10 @@ def export_frames_to_jpeg(source_image, frame_start, frame_end):
     """Export Blender image sequence frames to a temp JPEG directory.
 
     Must be called from the main thread (accesses bpy.context).
+    Reads pixels via foreach_get (respects image_user frame offset), then
+    writes them to a temp image whose colorspace matches the source, and
+    calls save_render() so the full color management pipeline is applied.
+
     Returns the path to the directory and the frame-to-index mapping.
     The video predictor expects JPEG files named 00000.jpg, 00001.jpg, etc.
     """
@@ -328,28 +332,55 @@ def export_frames_to_jpeg(source_image, frame_start, frame_end):
     os.makedirs(frames_dir)
 
     context = bpy.context
+    scene = context.scene
     space = context.space_data
-    original_frame = context.scene.frame_current
+    original_frame = scene.frame_current
+
+    img_settings = scene.render.image_settings
+    orig_format = img_settings.file_format
+    orig_mode = img_settings.color_mode
+    orig_quality = img_settings.quality
+
+    img_settings.file_format = 'JPEG'
+    img_settings.color_mode = 'RGB'
+    img_settings.quality = 95
+
+    w, h = source_image.size
+    n_pixels = w * h * 4
+    buf = np.zeros(n_pixels, dtype=np.float32)
+
+    tmp_img = bpy.data.images.new(
+        "_rf_export_tmp", w, h, alpha=True, float_buffer=True,
+    )
+    tmp_img.colorspace_settings.name = source_image.colorspace_settings.name
 
     frame_to_idx = {}
     idx = 0
 
-    iu = space.image_user
-    for frame_num in range(frame_start, frame_end + 1):
-        context.scene.frame_current = frame_num
-        # Compute the image-sequence-relative frame from the scene frame
-        iu.frame_current = frame_num - iu.frame_start + 1 + iu.frame_offset
-        space.display_channels = space.display_channels
+    try:
+        iu = space.image_user
+        for frame_num in range(frame_start, frame_end + 1):
+            scene.frame_current = frame_num
+            iu.frame_current = frame_num - iu.frame_start + 1 + iu.frame_offset
+            space.display_channels = space.display_channels
 
-        pixels_rgba = bpyimg_to_HWCuint8(source_image)
-        img = PIL.Image.fromarray(pixels_rgba).convert('RGB')
+            source_image.pixels.foreach_get(buf)
+            tmp_img.pixels.foreach_set(buf)
 
-        filename = f"{idx:05d}.jpg"
-        img.save(os.path.join(frames_dir, filename), quality=95)
-        frame_to_idx[frame_num] = idx
-        idx += 1
+            filename = f"{idx:05d}.jpg"
+            tmp_img.save_render(
+                filepath=os.path.join(frames_dir, filename),
+                scene=scene,
+            )
+            frame_to_idx[frame_num] = idx
+            idx += 1
+    finally:
+        bpy.data.images.remove(tmp_img, do_unlink=True)
+        img_settings.file_format = orig_format
+        img_settings.color_mode = orig_mode
+        img_settings.quality = orig_quality
+        scene.frame_current = original_frame
 
-    context.scene.frame_current = original_frame
     print(f'Exported {idx} frames to {frames_dir}')
     return frames_dir, frame_to_idx
 
@@ -395,8 +426,7 @@ def _save_propagated_masks(
             os.makedirs(img_seq_dir)
 
         frame_str = str(blender_frame).zfill(padding)
-        flipped = pil_mask.transpose(PIL.Image.FLIP_TOP_BOTTOM)
-        flipped.save(os.path.join(img_seq_dir, f"{frame_str}.png"))
+        pil_mask.save(os.path.join(img_seq_dir, f"{frame_str}.png"))
         saved += 1
 
         if status_callback:

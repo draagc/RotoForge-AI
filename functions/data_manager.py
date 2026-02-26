@@ -4,6 +4,19 @@ from bpy.app.handlers import persistent
 import os
 import shutil
 
+
+def _raw_colorspace_name():
+    """Return the 'unmanaged / raw' colorspace available in the active OCIO config."""
+    try:
+        items = bpy.types.ColorManagedInputColorspaceSettings.bl_rna.properties['name'].enum_items
+        names = {e.identifier for e in items}
+    except Exception:
+        names = set()
+    for candidate in ('Non-Color', 'Raw', 'raw', 'Utility - Raw'):
+        if candidate in names:
+            return candidate
+    return None
+
 # These are deferred imports — may not be available until deps are installed.
 # Registration must succeed without them so the user can access the install button.
 np = None
@@ -117,7 +130,9 @@ def update_maskseq(used_mask, outdated=False):
             else:
                 img.source = 'FILE'
             img.name = used_mask
-        img.colorspace_settings.name = 'Non-Color'
+        raw_cs = _raw_colorspace_name()
+        if raw_cs:
+            img.colorspace_settings.name = raw_cs
 
 
 
