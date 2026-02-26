@@ -6,13 +6,16 @@ Uses only Python stdlib + numpy — no torch, no sam3 needed on the Blender side
 """
 
 import base64
+import io
 import json
 import subprocess
 import sys
 import os
+import tarfile
 import time
 import urllib.request
 import urllib.error
+import zlib
 
 import numpy as np
 
@@ -22,15 +25,20 @@ import numpy as np
 # ---------------------------------------------------------------------------
 
 def ndarray_to_b64(arr: np.ndarray) -> dict:
+    raw = np.ascontiguousarray(arr).tobytes()
+    compressed = zlib.compress(raw, level=1)
     return {
-        "data": base64.b64encode(np.ascontiguousarray(arr).tobytes()).decode("ascii"),
+        "data": base64.b64encode(compressed).decode("ascii"),
         "shape": list(arr.shape),
         "dtype": str(arr.dtype),
+        "zlib": True,
     }
 
 
 def b64_to_ndarray(obj: dict) -> np.ndarray:
     raw = base64.b64decode(obj["data"])
+    if obj.get("zlib"):
+        raw = zlib.decompress(raw)
     return np.frombuffer(raw, dtype=np.dtype(obj["dtype"])).reshape(obj["shape"])
 
 
@@ -251,26 +259,29 @@ class SAM3Client:
     # -- video session API (temporal tracking) --------------------------------
 
     def video_upload_frames(self, local_frames_dir: str) -> str:
-        """Upload local JPEG frames to the server and return a server-side path.
+        """Upload local JPEG frames to the server as a tar archive.
 
         Used for remote servers where the local filesystem isn't shared.
-        Reads every .jpg from local_frames_dir, base64-encodes them, and
-        sends them in a single POST. The server writes them to a temp dir.
+        Packs all .jpg files into an uncompressed tar (JPEGs are already
+        compressed) and sends the raw bytes. ~33% smaller than base64-in-JSON.
 
         Returns:
             The server-side directory path containing the uploaded frames.
         """
-        frames = {}
-        for fname in sorted(os.listdir(local_frames_dir)):
-            if not fname.lower().endswith(('.jpg', '.jpeg')):
-                continue
-            fpath = os.path.join(local_frames_dir, fname)
-            with open(fpath, "rb") as f:
-                frames[fname] = base64.b64encode(f.read()).decode("ascii")
+        buf = io.BytesIO()
+        count = 0
+        with tarfile.open(fileobj=buf, mode="w") as tar:
+            for fname in sorted(os.listdir(local_frames_dir)):
+                if not fname.lower().endswith(('.jpg', '.jpeg')):
+                    continue
+                tar.add(os.path.join(local_frames_dir, fname), arcname=fname)
+                count += 1
 
-        print(f"RotoForge AI: Uploading {len(frames)} frames to server...")
-        resp = self._request("POST", "/video/upload_frames",
-                             {"frames": frames}, timeout=300)
+        print(f"RotoForge AI: Uploading {count} frames to server...")
+        resp = self._request_binary("POST", "/video/upload_frames",
+                                    buf.getvalue(),
+                                    content_type="application/x-tar",
+                                    timeout=300)
         print(f"RotoForge AI: Frames uploaded to server")
         return resp["frames_dir"]
 
@@ -289,7 +300,8 @@ class SAM3Client:
         return resp["session_id"]
 
     def video_add_prompt(self, session_id: str, frame_index: int,
-                         text=None, points=None, labels=None, obj_id=None):
+                         text=None, points=None, labels=None, obj_id=None,
+                         confidence_threshold=None):
         """Add a prompt on a specific frame in a video session.
 
         Args:
@@ -299,6 +311,7 @@ class SAM3Client:
             points: list of [x, y] normalized coords (0-1), or None.
             labels: list of 0/1 for points, or None.
             obj_id: optional explicit object ID.
+            confidence_threshold: detection confidence for text prompts.
 
         Returns:
             dict with 'masks' (list of np arrays), 'obj_ids', 'scores'.
@@ -309,6 +322,8 @@ class SAM3Client:
         }
         if text is not None:
             payload["text"] = text
+        if confidence_threshold is not None:
+            payload["confidence_threshold"] = confidence_threshold
         if points is not None:
             payload["points"] = points
             payload["labels"] = labels if labels is not None else [1] * len(points)
@@ -324,18 +339,21 @@ class SAM3Client:
             "scores": resp.get("scores", []),
         }
 
-    def video_propagate(self, session_id: str, direction="both"):
+    def video_propagate(self, session_id: str, direction="both",
+                        fill_hole_area=16):
         """Propagate tracking across all video frames.
 
         Args:
             session_id: active session.
             direction: "forward", "backward", or "both".
+            fill_hole_area: pixel area threshold for hole filling (0 = disabled).
 
         Returns:
             dict mapping frame_index (int) → {"masks": [np arrays], "obj_ids": [ints]}.
         """
         resp = self._request("POST", "/video/propagate",
-                             {"session_id": session_id, "direction": direction},
+                             {"session_id": session_id, "direction": direction,
+                              "fill_hole_area": fill_hole_area},
                              timeout=600)
 
         results = {}
@@ -364,6 +382,21 @@ class SAM3Client:
             data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"
 
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"SAM3 server error {e.code}: {error_body}") from e
+        except urllib.error.URLError as e:
+            raise ConnectionError(f"Cannot reach SAM3 server at {url}: {e}") from e
+
+    def _request_binary(self, method: str, path: str, data: bytes,
+                        content_type: str, timeout=300):
+        """Send raw binary data, expect a JSON response."""
+        url = self.base_url + path
+        headers = {"Content-Type": content_type}
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:

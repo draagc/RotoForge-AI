@@ -7,6 +7,7 @@ operators for both point/box and text prompting.
 
 import bpy
 import os
+import threading
 from time import process_time
 
 from .install_dependencies import get_venv_python, get_server_script, get_install_folder
@@ -44,6 +45,10 @@ def _ensure_modules():
 
 _client = None  # SAM3Client instance, created on demand
 
+# Tracking progress state — read by the panel to show loading UI
+_tracking_busy = False
+_tracking_status = ""
+
 
 def _get_prefs():
     """Return the addon preferences."""
@@ -71,6 +76,7 @@ def _get_client() -> SAM3Client:
 
     if _client is None:
         _client = SAM3Client(host=host, port=port)
+        _client._is_remote = (prefs.server_mode == "remote")
     return _client
 
 
@@ -613,10 +619,20 @@ class TrackVideoTextOperator(bpy.types.Operator):
     """Track with text prompt using SAM3 video predictor (temporal memory, all frames at once)"""
     bl_idname = "rotoforge.track_video_text"
     bl_label = "Video Track (Text)"
-    bl_options = {'REGISTER', 'UNDO'}
+    bl_options = {'REGISTER'}
+
+    _thread: threading.Thread = None
+    _timer = None
+    _saved: int = 0
+    _error: str = ""
+    _status: str = ""
+    _used_mask: str = ""
+    _start_time: float = 0
 
     @classmethod
     def poll(cls, context):
+        if _tracking_busy:
+            return False
         if context.space_data.image is None:
             return False
         if context.space_data.image.source not in ['SEQUENCE', 'MOVIE']:
@@ -627,7 +643,8 @@ class TrackVideoTextOperator(bpy.types.Operator):
         props = space.mask.rotoforge_maskgencontrols[space.mask.layers.active.name]
         return bool(props.text_prompt.strip())
 
-    def execute(self, context):
+    def invoke(self, context, event):
+        global _tracking_busy, _tracking_status
         space = context.space_data
         mask = space.mask
         layer = mask.layers.active
@@ -640,30 +657,100 @@ class TrackVideoTextOperator(bpy.types.Operator):
             self.report({'ERROR'}, str(e))
             return {'CANCELLED'}
 
-        start = process_time()
-        used_mask = f"{mask.name}/MaskLayers/{layer.name}"
+        self._start_time = process_time()
+        self._used_mask = f"{mask.name}/MaskLayers/{layer.name}"
+        self._error = ""
+        self._saved = 0
 
-        saved = generate_masks.track_video_text(
-            source_image=image,
-            used_mask=used_mask,
-            client=client,
-            text_prompt=props.text_prompt.strip(),
-            frame_start=mask.frame_start,
-            frame_end=mask.frame_end,
-            prompt_frame=context.scene.frame_current,
-            blur_radius=props.feather_radius,
-            confidence_threshold=props.text_confidence,
-            direction="both",
+        _tracking_busy = True
+        _tracking_status = "Exporting frames..."
+        self._status = _tracking_status
+        context.area.header_text_set(f"RotoForge: {self._status}")
+
+        local_frames_dir, frame_to_idx = generate_masks.export_frames_to_jpeg(
+            image, mask.frame_start, mask.frame_end
         )
 
-        # Reload mask sequence
-        if used_mask in bpy.data.images:
-            bpy.data.images.remove(bpy.data.images[used_mask], do_unlink=True)
-        data_manager.update_maskseq(used_mask)
-        overlay.invalidate_overlay_cache()
+        scene_frame_end = context.scene.frame_end
+        prompt_frame = context.scene.frame_current
+        text_prompt = props.text_prompt.strip()
+        blur_radius = props.feather_radius
+        confidence_threshold = props.text_confidence
+        fill_hole_area = props.fill_hole_area
+        frame_start = mask.frame_start
+        frame_end = mask.frame_end
+        used_mask = self._used_mask
 
-        self.report({'INFO'}, f'Video tracked {saved} frames with text prompt: {used_mask}')
-        time_checkpoint(start, 'Video text tracking')
+        def _status_cb(s):
+            global _tracking_status
+            self._status = s
+            _tracking_status = s
+
+        def _bg():
+            try:
+                self._saved = generate_masks.server_track_video_text(
+                    client=client,
+                    local_frames_dir=local_frames_dir,
+                    frame_to_idx=frame_to_idx,
+                    used_mask=used_mask,
+                    text_prompt=text_prompt,
+                    frame_start=frame_start,
+                    frame_end=frame_end,
+                    prompt_frame=prompt_frame,
+                    blur_radius=blur_radius,
+                    confidence_threshold=confidence_threshold,
+                    direction="both",
+                    scene_frame_end=scene_frame_end,
+                    fill_hole_area=fill_hole_area,
+                    status_callback=_status_cb,
+                )
+            except Exception as e:
+                self._error = str(e)
+                import traceback
+                traceback.print_exc()
+
+        self._thread = threading.Thread(target=_bg, daemon=True)
+        self._thread.start()
+
+        self._timer = context.window_manager.event_timer_add(0.5, window=context.window)
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def _finish(self, context):
+        global _tracking_busy, _tracking_status
+        context.window_manager.event_timer_remove(self._timer)
+        context.area.header_text_set(None)
+        _tracking_busy = False
+        _tracking_status = ""
+
+    def modal(self, context, event):
+        if event.type == 'ESC':
+            self._finish(context)
+            self.report({'WARNING'}, "Tracking continues in background")
+            return {'CANCELLED'}
+
+        if event.type != 'TIMER':
+            return {'PASS_THROUGH'}
+
+        if self._thread.is_alive():
+            context.area.header_text_set(f"RotoForge: {self._status}")
+            context.area.tag_redraw()
+            return {'PASS_THROUGH'}
+
+        self._finish(context)
+
+        if self._error:
+            self.report({'ERROR'}, self._error)
+            return {'CANCELLED'}
+
+        if self._used_mask in bpy.data.images:
+            bpy.data.images.remove(bpy.data.images[self._used_mask], do_unlink=True)
+        data_manager.update_maskseq(self._used_mask)
+        overlay.invalidate_overlay_cache()
+        context.scene.rotoforge_overlaycontrols.used_mask = self._used_mask
+
+        self.report({'INFO'}, f'Video tracked {self._saved} frames with text prompt: {self._used_mask}')
+        time_checkpoint(self._start_time, 'Video text tracking')
         return {'FINISHED'}
 
 
@@ -671,15 +758,26 @@ class TrackVideoPointsOperator(bpy.types.Operator):
     """Track with point/box prompt using SAM3 video predictor (temporal memory, all frames at once)"""
     bl_idname = "rotoforge.track_video_points"
     bl_label = "Video Track (Points)"
-    bl_options = {'REGISTER', 'UNDO'}
+    bl_options = {'REGISTER'}
+
+    _thread: threading.Thread = None
+    _timer = None
+    _saved: int = 0
+    _error: str = ""
+    _status: str = ""
+    _used_mask: str = ""
+    _start_time: float = 0
 
     @classmethod
     def poll(cls, context):
+        if _tracking_busy:
+            return False
         if context.space_data.image is None:
             return False
         return context.space_data.image.source in ['SEQUENCE', 'MOVIE']
 
-    def execute(self, context):
+    def invoke(self, context, event):
+        global _tracking_busy, _tracking_status
         space = context.space_data
         mask = space.mask
         layer = mask.layers.active
@@ -696,7 +794,7 @@ class TrackVideoPointsOperator(bpy.types.Operator):
             self.report({'ERROR'}, str(e))
             return {'CANCELLED'}
 
-        start = process_time()
+        self._start_time = process_time()
         resolution = tuple(image.size)
         prompt_points, prompt_labels = prompt_utils.extract_prompt_points(mask, resolution)
 
@@ -704,28 +802,99 @@ class TrackVideoPointsOperator(bpy.types.Operator):
             self.report({'ERROR'}, 'No valid prompt points found.')
             return {'CANCELLED'}
 
-        used_mask = f"{mask.name}/MaskLayers/{layer.name}"
+        self._used_mask = f"{mask.name}/MaskLayers/{layer.name}"
+        self._error = ""
+        self._saved = 0
 
-        saved = generate_masks.track_video_points(
-            source_image=image,
-            used_mask=used_mask,
-            client=client,
-            frame_start=mask.frame_start,
-            frame_end=mask.frame_end,
-            prompt_frame=context.scene.frame_current,
-            input_points=prompt_points,
-            input_labels=prompt_labels,
-            blur_radius=props.feather_radius,
-            direction="both",
+        _tracking_busy = True
+        _tracking_status = "Exporting frames..."
+        self._status = _tracking_status
+        context.area.header_text_set(f"RotoForge: {self._status}")
+
+        local_frames_dir, frame_to_idx = generate_masks.export_frames_to_jpeg(
+            image, mask.frame_start, mask.frame_end
         )
 
-        if used_mask in bpy.data.images:
-            bpy.data.images.remove(bpy.data.images[used_mask], do_unlink=True)
-        data_manager.update_maskseq(used_mask)
-        overlay.invalidate_overlay_cache()
+        scene_frame_end = context.scene.frame_end
+        prompt_frame = context.scene.frame_current
+        blur_radius = props.feather_radius
+        fill_hole_area = props.fill_hole_area
+        frame_start = mask.frame_start
+        frame_end = mask.frame_end
+        image_size = resolution
+        used_mask = self._used_mask
 
-        self.report({'INFO'}, f'Video tracked {saved} frames with point prompt: {used_mask}')
-        time_checkpoint(start, 'Video point tracking')
+        def _status_cb(s):
+            global _tracking_status
+            self._status = s
+            _tracking_status = s
+
+        def _bg():
+            try:
+                self._saved = generate_masks.server_track_video_points(
+                    client=client,
+                    local_frames_dir=local_frames_dir,
+                    frame_to_idx=frame_to_idx,
+                    used_mask=used_mask,
+                    image_size=image_size,
+                    frame_start=frame_start,
+                    frame_end=frame_end,
+                    prompt_frame=prompt_frame,
+                    input_points=prompt_points,
+                    input_labels=prompt_labels,
+                    blur_radius=blur_radius,
+                    direction="both",
+                    scene_frame_end=scene_frame_end,
+                    fill_hole_area=fill_hole_area,
+                    status_callback=_status_cb,
+                )
+            except Exception as e:
+                self._error = str(e)
+                import traceback
+                traceback.print_exc()
+
+        self._thread = threading.Thread(target=_bg, daemon=True)
+        self._thread.start()
+
+        self._timer = context.window_manager.event_timer_add(0.5, window=context.window)
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def _finish(self, context):
+        global _tracking_busy, _tracking_status
+        context.window_manager.event_timer_remove(self._timer)
+        context.area.header_text_set(None)
+        _tracking_busy = False
+        _tracking_status = ""
+
+    def modal(self, context, event):
+        if event.type == 'ESC':
+            self._finish(context)
+            self.report({'WARNING'}, "Tracking continues in background")
+            return {'CANCELLED'}
+
+        if event.type != 'TIMER':
+            return {'PASS_THROUGH'}
+
+        if self._thread.is_alive():
+            context.area.header_text_set(f"RotoForge: {self._status}")
+            context.area.tag_redraw()
+            return {'PASS_THROUGH'}
+
+        self._finish(context)
+
+        if self._error:
+            self.report({'ERROR'}, self._error)
+            return {'CANCELLED'}
+
+        if self._used_mask in bpy.data.images:
+            bpy.data.images.remove(bpy.data.images[self._used_mask], do_unlink=True)
+        data_manager.update_maskseq(self._used_mask)
+        overlay.invalidate_overlay_cache()
+        context.scene.rotoforge_overlaycontrols.used_mask = self._used_mask
+
+        self.report({'INFO'}, f'Video tracked {self._saved} frames with point prompt: {self._used_mask}')
+        time_checkpoint(self._start_time, 'Video point tracking')
         return {'FINISHED'}
 
 
@@ -999,17 +1168,16 @@ class RotoForgeMaskPanel(bpy.types.Panel):
         active_layer = mask.layers.active
         props = mask.rotoforge_maskgencontrols[active_layer.name]
 
-        # Global Settings
-        global_settings = layout.box()
-        global_settings.label(text="Global Settings")
-        global_settings.prop(props, "used_model")
-        global_settings.prop(props, "guide_strength")
-        global_settings.prop(props, "feather_radius")
+        # Mask Settings
+        settings_box = layout.box()
+        settings_box.label(text="Mask Settings")
+        settings_box.prop(props, "feather_radius")
+        settings_box.prop(props, "fill_hole_area")
         layout.separator()
 
         # Text Prompt
         text_box = layout.box()
-        text_box.label(text="Text Prompt (SAM3)")
+        text_box.label(text="Text Prompt")
         text_box.prop(props, "text_prompt", text="")
         row = text_box.row(align=True)
         row.prop(props, "text_confidence")
@@ -1029,19 +1197,19 @@ class RotoForgeMaskPanel(bpy.types.Panel):
         op = row.operator("rotoforge.track_text_mask", text="", icon='TRACKING_FORWARDS')
         op.backwards = False
 
-        text_box.operator("rotoforge.track_video_text", text="Video Track (All Frames)", icon='SEQUENCE')
+        if _tracking_busy:
+            row = text_box.row(align=True)
+            row.alert = True
+            row.label(text=_tracking_status or "Tracking...", icon='SORTTIME')
+            row.enabled = False
+        else:
+            text_box.operator("rotoforge.track_video_text", text="Video Track (All Frames)", icon='SEQUENCE')
         layout.separator()
 
-        # Tracking Settings (point/box)
-        tracking_settings = layout.box()
-        tracking_settings.label(text="Point/Box Tracking Settings")
-        tracking_settings.prop(props, "tracking")
-        tracking_settings.prop(props, "search_radius")
-        layout.separator()
-
-        # Point/Box Generation
+        # Point/Box Prompt
         box = layout.box()
-        box.label(text="Point/Box Generation")
+        box.label(text="Point/Box Prompt")
+
         row = box.row(align=True)
         row.label(text="Static:")
         row = row.row(align=True)
@@ -1056,7 +1224,18 @@ class RotoForgeMaskPanel(bpy.types.Panel):
         op = box.operator("rotoforge.track_mask", text="", icon='TRACKING_FORWARDS')
         op.backwards = False
 
-        box.operator("rotoforge.track_video_points", text="Video Track (All Frames)", icon='SEQUENCE')
+        if _tracking_busy:
+            row = box.row(align=True)
+            row.alert = True
+            row.label(text=_tracking_status or "Tracking...", icon='SORTTIME')
+            row.enabled = False
+        else:
+            box.operator("rotoforge.track_video_points", text="Video Track (All Frames)", icon='SEQUENCE')
+
+        col = box.column(align=True)
+        col.prop(props, "guide_strength")
+        col.prop(props, "tracking")
+        col.prop(props, "search_radius")
         layout.separator()
 
         # Active Spline Settings

@@ -15,12 +15,15 @@ Usage:
 
 import argparse
 import base64
+import io
 import json
 import os
 import sys
+import tarfile
 import tempfile
 import threading
 import traceback
+import zlib
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import numpy as np
@@ -269,7 +272,8 @@ def video_start_session(frames_dir: str):
 
 
 def video_add_prompt(session_id: str, frame_index: int,
-                     text=None, points=None, labels=None, obj_id=None):
+                     text=None, points=None, labels=None, obj_id=None,
+                     confidence_threshold=None):
     """Add a prompt on a specific frame in a video session.
 
     Args:
@@ -279,7 +283,12 @@ def video_add_prompt(session_id: str, frame_index: int,
         points: list of [x, y] normalized coords, or None
         labels: list of 0/1 labels for points, or None
         obj_id: optional object ID to assign
+        confidence_threshold: detection confidence for text prompts
     """
+    if confidence_threshold is not None and _video_predictor is not None:
+        if hasattr(_video_predictor, 'model'):
+            _video_predictor.model.score_threshold_detection = confidence_threshold
+
     request = dict(
         type="add_prompt",
         session_id=session_id,
@@ -320,19 +329,23 @@ def video_add_prompt(session_id: str, frame_index: int,
     }
 
 
-def video_propagate(session_id: str, direction="both"):
+def video_propagate(session_id: str, direction="both", fill_hole_area=16):
     """Propagate tracking across all frames. Returns a dict of frame_index → masks.
 
     Args:
         session_id: active session
         direction: "forward", "backward", or "both"
+        fill_hole_area: pixel area threshold for hole filling (0 = disabled)
     """
+    if _video_predictor is not None and hasattr(_video_predictor, 'model'):
+        _video_predictor.model.fill_hole_area = fill_hole_area
+
     results = {}
 
     for frame_result in _video_predictor.handle_stream_request(dict(
         type="propagate_in_video",
         session_id=session_id,
-        direction=direction,
+        propagation_direction=direction,
     )):
         frame_idx = frame_result.get("frame_index")
         outputs = frame_result.get("outputs", {})
@@ -373,15 +386,20 @@ def video_close_session(session_id: str):
 # ---------------------------------------------------------------------------
 
 def ndarray_to_b64(arr: np.ndarray) -> dict:
+    raw = np.ascontiguousarray(arr).tobytes()
+    compressed = zlib.compress(raw, level=1)
     return {
-        "data": base64.b64encode(np.ascontiguousarray(arr).tobytes()).decode("ascii"),
+        "data": base64.b64encode(compressed).decode("ascii"),
         "shape": list(arr.shape),
         "dtype": str(arr.dtype),
+        "zlib": True,
     }
 
 
 def b64_to_ndarray(obj: dict) -> np.ndarray:
     raw = base64.b64decode(obj["data"])
+    if obj.get("zlib"):
+        raw = zlib.decompress(raw)
     return np.frombuffer(raw, dtype=np.dtype(obj["dtype"])).reshape(obj["shape"])
 
 
@@ -403,6 +421,10 @@ class SAM3Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length)
         return json.loads(raw)
+
+    def _read_binary(self) -> bytes:
+        length = int(self.headers.get("Content-Length", 0))
+        return self.rfile.read(length)
 
     def log_message(self, format, *args):
         pass
@@ -524,20 +546,29 @@ class SAM3Handler(BaseHTTPRequestHandler):
     # ----- video session routes -----
 
     def _handle_video_upload_frames(self):
-        """Receive base64-encoded JPEG frames and write them to a temp dir."""
-        data = self._read_json()
-        frames = data.get("frames", {})
-        if not frames:
-            self._send_json(400, {"error": "no frames provided"})
-            return
-
+        """Receive JPEG frames as a tar archive and extract to a temp dir."""
+        content_type = self.headers.get("Content-Type", "")
         tmp_dir = tempfile.mkdtemp(prefix="rotoforge_frames_")
-        for fname, b64data in frames.items():
-            fpath = os.path.join(tmp_dir, fname)
-            with open(fpath, "wb") as f:
-                f.write(base64.b64decode(b64data))
 
-        print(f"[sam3_server] Received {len(frames)} frames → {tmp_dir}")
+        if "application/x-tar" in content_type:
+            raw = self._read_binary()
+            with tarfile.open(fileobj=io.BytesIO(raw), mode="r") as tar:
+                tar.extractall(tmp_dir, filter="data")
+            count = len([f for f in os.listdir(tmp_dir)
+                         if f.lower().endswith(('.jpg', '.jpeg'))])
+        else:
+            data = self._read_json()
+            frames = data.get("frames", {})
+            if not frames:
+                self._send_json(400, {"error": "no frames provided"})
+                return
+            for fname, b64data in frames.items():
+                fpath = os.path.join(tmp_dir, fname)
+                with open(fpath, "wb") as f:
+                    f.write(base64.b64decode(b64data))
+            count = len(frames)
+
+        print(f"[sam3_server] Received {count} frames → {tmp_dir}")
         self._send_json(200, {"frames_dir": tmp_dir})
 
     def _handle_video_start(self):
@@ -566,6 +597,7 @@ class SAM3Handler(BaseHTTPRequestHandler):
                 points=data.get("points"),
                 labels=data.get("labels"),
                 obj_id=data.get("obj_id"),
+                confidence_threshold=data.get("confidence_threshold"),
             )
 
         resp = {"obj_ids": result["obj_ids"], "scores": result["scores"]}
@@ -581,9 +613,11 @@ class SAM3Handler(BaseHTTPRequestHandler):
             return
         data = self._read_json()
         direction = data.get("direction", "both")
+        fill_hole_area = data.get("fill_hole_area", 16)
 
         with _lock:
-            results = video_propagate(data["session_id"], direction)
+            results = video_propagate(data["session_id"], direction,
+                                      fill_hole_area=fill_hole_area)
 
         resp = {}
         for frame_idx, frame_data in results.items():

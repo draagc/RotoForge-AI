@@ -315,9 +315,10 @@ def track_mask_text(
 # Video tracking — SAM3 native temporal tracking
 # ---------------------------------------------------------------------------
 
-def _export_frames_to_jpeg(source_image, frame_start, frame_end):
+def export_frames_to_jpeg(source_image, frame_start, frame_end):
     """Export Blender image sequence frames to a temp JPEG directory.
 
+    Must be called from the main thread (accesses bpy.context).
     Returns the path to the directory and the frame-to-index mapping.
     The video predictor expects JPEG files named 00000.jpg, 00001.jpg, etc.
     """
@@ -333,10 +334,11 @@ def _export_frames_to_jpeg(source_image, frame_start, frame_end):
     frame_to_idx = {}
     idx = 0
 
+    iu = space.image_user
     for frame_num in range(frame_start, frame_end + 1):
         context.scene.frame_current = frame_num
-        space.image_user.frame_current = frame_num
-        # Force viewport update
+        # Compute the image-sequence-relative frame from the scene frame
+        iu.frame_current = frame_num - iu.frame_start + 1 + iu.frame_offset
         space.display_channels = space.display_channels
 
         pixels_rgba = bpyimg_to_HWCuint8(source_image)
@@ -357,6 +359,122 @@ def _idx_to_frame(frame_to_idx):
     return {v: k for k, v in frame_to_idx.items()}
 
 
+def _save_propagated_masks(
+    all_frames, idx_to_frame, used_mask,
+    frame_end, scene_frame_end, blur_radius,
+    status_callback=None,
+):
+    """Save propagated masks to disk — thread-safe (no bpy access)."""
+    saved = 0
+    total = len(all_frames)
+    max_frame = max(frame_end, scene_frame_end)
+    padding = len(str(max_frame))
+
+    for video_idx, frame_data in sorted(all_frames.items()):
+        if video_idx not in idx_to_frame:
+            continue
+
+        blender_frame = idx_to_frame[video_idx]
+        masks = frame_data["masks"]
+
+        if not masks:
+            continue
+
+        combined = np.zeros_like(masks[0], dtype=np.uint8)
+        for m in masks:
+            combined = np.maximum(combined, m.astype(np.uint8) * 255)
+
+        if blur_radius > 0:
+            pil_mask = PIL.Image.fromarray(combined).convert('RGBA')
+            pil_mask = pil_mask.filter(PIL.ImageFilter.BoxBlur(radius=blur_radius))
+        else:
+            pil_mask = PIL.Image.fromarray(combined).convert('RGBA')
+
+        img_seq_dir = os.path.join(get_rotoforge_dir('masksequences'), used_mask)
+        if not os.path.isdir(img_seq_dir):
+            os.makedirs(img_seq_dir)
+
+        frame_str = str(blender_frame).zfill(padding)
+        flipped = pil_mask.transpose(PIL.Image.FLIP_TOP_BOTTOM)
+        flipped.save(os.path.join(img_seq_dir, f"{frame_str}.png"))
+        saved += 1
+
+        if status_callback:
+            status_callback(f"Saving masks ({saved}/{total})...")
+
+    print(f'Saved {saved} tracked frames')
+    return saved
+
+
+def server_track_video_text(
+    client, local_frames_dir, frame_to_idx,
+    used_mask, text_prompt,
+    frame_start, frame_end, prompt_frame,
+    blur_radius=0.2, confidence_threshold=0.5,
+    direction="both", scene_frame_end=0,
+    fill_hole_area=16,
+    status_callback=None,
+):
+    """Server-side video text tracking — thread-safe (no bpy access).
+
+    Call export_frames_to_jpeg() on the main thread first, then pass
+    the results here. Safe to call from a background thread.
+    """
+    idx_to_frame = _idx_to_frame(frame_to_idx)
+
+    if status_callback:
+        status_callback("Loading model...")
+    if not client.is_video_model_loaded():
+        client.load_video_model()
+
+    if status_callback:
+        status_callback("Uploading frames...")
+    if client._is_remote:
+        server_frames_dir = client.video_upload_frames(local_frames_dir)
+    else:
+        server_frames_dir = local_frames_dir
+
+    if status_callback:
+        status_callback("Starting video session...")
+    session_id = client.video_start_session(server_frames_dir)
+
+    try:
+        if prompt_frame not in frame_to_idx:
+            prompt_frame = max(frame_start, min(prompt_frame, frame_end))
+        prompt_idx = frame_to_idx[prompt_frame]
+        print(f'Adding text prompt "{text_prompt}" on frame {prompt_frame} (idx {prompt_idx})')
+
+        if status_callback:
+            status_callback(f'Prompting: "{text_prompt}"...')
+        result = client.video_add_prompt(
+            session_id=session_id,
+            frame_index=prompt_idx,
+            text=text_prompt,
+            confidence_threshold=confidence_threshold,
+        )
+        if not result["masks"]:
+            print('No objects detected for text prompt on the initial frame')
+            return 0
+
+        n_obj = len(result["obj_ids"])
+        print(f'Detected {n_obj} object(s), propagating {direction}...')
+        if status_callback:
+            status_callback(f"Propagating ({n_obj} objects)...")
+        all_frames = client.video_propagate(session_id, direction=direction,
+                                            fill_hole_area=fill_hole_area)
+
+        return _save_propagated_masks(
+            all_frames, idx_to_frame, used_mask,
+            frame_end, scene_frame_end, blur_radius,
+            status_callback=status_callback,
+        )
+
+    finally:
+        client.video_close_session(session_id)
+        if os.path.isdir(local_frames_dir):
+            shutil.rmtree(local_frames_dir)
+
+
 def track_video_text(
     source_image,
     used_mask,
@@ -370,95 +488,96 @@ def track_video_text(
     direction="both",
     progress_callback=None,
 ):
-    """Run SAM3 video tracking with a text prompt.
-
-    Exports frames, starts a video session, prompts on prompt_frame,
-    propagates, and saves all resulting masks.
-
-    Args:
-        progress_callback: optional callable(frame_num, total_frames)
-            for UI progress reporting.
-
-    Returns:
-        number of frames successfully tracked.
-    """
+    """Convenience wrapper — exports frames then tracks. Blocks the caller."""
     print(f'Exporting frames {frame_start}-{frame_end}...')
-    local_frames_dir, frame_to_idx = _export_frames_to_jpeg(
+    local_frames_dir, frame_to_idx = export_frames_to_jpeg(
         source_image, frame_start, frame_end
     )
+    return server_track_video_text(
+        client=client,
+        local_frames_dir=local_frames_dir,
+        frame_to_idx=frame_to_idx,
+        used_mask=used_mask,
+        text_prompt=text_prompt,
+        frame_start=frame_start,
+        frame_end=frame_end,
+        prompt_frame=prompt_frame,
+        blur_radius=blur_radius,
+        confidence_threshold=confidence_threshold,
+        direction=direction,
+        scene_frame_end=bpy.context.scene.frame_end,
+    )
+
+
+def server_track_video_points(
+    client, local_frames_dir, frame_to_idx,
+    used_mask, image_size,
+    frame_start, frame_end, prompt_frame,
+    input_points=None, input_labels=None,
+    blur_radius=0.2, direction="both",
+    scene_frame_end=0, fill_hole_area=16,
+    status_callback=None,
+):
+    """Server-side video point tracking — thread-safe (no bpy access).
+
+    Call export_frames_to_jpeg() on the main thread first, then pass
+    the results here. Safe to call from a background thread.
+    """
     idx_to_frame = _idx_to_frame(frame_to_idx)
 
+    if status_callback:
+        status_callback("Loading model...")
     if not client.is_video_model_loaded():
-        print('Loading video model...')
         client.load_video_model()
 
+    if status_callback:
+        status_callback("Uploading frames...")
     if client._is_remote:
         server_frames_dir = client.video_upload_frames(local_frames_dir)
     else:
         server_frames_dir = local_frames_dir
 
+    if status_callback:
+        status_callback("Starting video session...")
     session_id = client.video_start_session(server_frames_dir)
 
     try:
         if prompt_frame not in frame_to_idx:
             prompt_frame = max(frame_start, min(prompt_frame, frame_end))
         prompt_idx = frame_to_idx[prompt_frame]
-        print(f'Adding text prompt "{text_prompt}" on frame {prompt_frame} (idx {prompt_idx})')
+        width, height = image_size
 
+        norm_points = None
+        if input_points is not None:
+            norm_points = [[float(p[0]) / width, float(p[1]) / height] for p in input_points]
+        norm_labels = None
+        if input_labels is not None:
+            norm_labels = [int(l) for l in input_labels]
+
+        print(f'Adding point prompt on frame {prompt_frame} (idx {prompt_idx})')
+        if status_callback:
+            status_callback("Prompting with points...")
         result = client.video_add_prompt(
             session_id=session_id,
             frame_index=prompt_idx,
-            text=text_prompt,
+            points=norm_points,
+            labels=norm_labels,
         )
         if not result["masks"]:
-            print('No objects detected for text prompt on the initial frame')
+            print('No objects detected for point prompt on the initial frame')
             return 0
 
-        print(f'Detected {len(result["obj_ids"])} object(s), propagating {direction}...')
-        all_frames = client.video_propagate(session_id, direction=direction)
+        print(f'Propagating {direction}...')
+        if status_callback:
+            status_callback("Propagating...")
+        all_frames = client.video_propagate(session_id, direction=direction,
+                                            fill_hole_area=fill_hole_area)
 
-        saved = 0
-        total = len(all_frames)
-        max_frame = max(frame_end, bpy.context.scene.frame_end)
-        padding = len(str(max_frame))
-
-        for video_idx, frame_data in sorted(all_frames.items()):
-            if video_idx not in idx_to_frame:
-                continue
-
-            blender_frame = idx_to_frame[video_idx]
-            masks = frame_data["masks"]
-
-            if not masks:
-                continue
-
-            # Union all tracked objects into a single mask
-            combined = np.zeros_like(masks[0], dtype=np.uint8)
-            for m in masks:
-                combined = np.maximum(combined, m.astype(np.uint8) * 255)
-
-            # Apply blur
-            if blur_radius > 0:
-                pil_mask = PIL.Image.fromarray(combined).convert('RGBA')
-                pil_mask = pil_mask.filter(PIL.ImageFilter.BoxBlur(radius=blur_radius))
-            else:
-                pil_mask = PIL.Image.fromarray(combined).convert('RGBA')
-
-            # Save as PNG in the mask sequence directory
-            img_seq_dir = os.path.join(get_rotoforge_dir('masksequences'), used_mask)
-            if not os.path.isdir(img_seq_dir):
-                os.makedirs(img_seq_dir)
-
-            frame_str = str(blender_frame).zfill(padding)
-            flipped = pil_mask.transpose(PIL.Image.FLIP_TOP_BOTTOM)
-            flipped.save(os.path.join(img_seq_dir, f"{frame_str}.png"))
-            saved += 1
-
-            if progress_callback:
-                progress_callback(saved, total)
-
-        print(f'Saved {saved} tracked frames')
-        return saved
+        return _save_propagated_masks(
+            all_frames, idx_to_frame, used_mask,
+            frame_end, scene_frame_end, blur_radius,
+            status_callback=status_callback,
+        )
 
     finally:
         client.video_close_session(session_id)
@@ -479,97 +598,23 @@ def track_video_points(
     direction="both",
     progress_callback=None,
 ):
-    """Run SAM3 video tracking with point prompts.
-
-    Points are in pixel coordinates and get normalized to [0, 1]
-    for the video predictor.
-    """
+    """Convenience wrapper — exports frames then tracks. Blocks the caller."""
     print(f'Exporting frames {frame_start}-{frame_end}...')
-    local_frames_dir, frame_to_idx = _export_frames_to_jpeg(
+    local_frames_dir, frame_to_idx = export_frames_to_jpeg(
         source_image, frame_start, frame_end
     )
-    idx_to_frame = _idx_to_frame(frame_to_idx)
-
-    if not client.is_video_model_loaded():
-        print('Loading video model...')
-        client.load_video_model()
-
-    if client._is_remote:
-        server_frames_dir = client.video_upload_frames(local_frames_dir)
-    else:
-        server_frames_dir = local_frames_dir
-
-    session_id = client.video_start_session(server_frames_dir)
-
-    try:
-        if prompt_frame not in frame_to_idx:
-            prompt_frame = max(frame_start, min(prompt_frame, frame_end))
-        prompt_idx = frame_to_idx[prompt_frame]
-        width, height = source_image.size
-
-        # Normalize points to [0, 1] for video predictor
-        norm_points = None
-        if input_points is not None:
-            norm_points = [[float(p[0]) / width, float(p[1]) / height] for p in input_points]
-        norm_labels = None
-        if input_labels is not None:
-            norm_labels = [int(l) for l in input_labels]
-
-        print(f'Adding point prompt on frame {prompt_frame} (idx {prompt_idx})')
-        result = client.video_add_prompt(
-            session_id=session_id,
-            frame_index=prompt_idx,
-            points=norm_points,
-            labels=norm_labels,
-        )
-        if not result["masks"]:
-            print('No objects detected for point prompt on the initial frame')
-            return 0
-
-        print(f'Propagating {direction}...')
-        all_frames = client.video_propagate(session_id, direction=direction)
-
-        saved = 0
-        total = len(all_frames)
-        max_frame = max(frame_end, bpy.context.scene.frame_end)
-        padding = len(str(max_frame))
-
-        for video_idx, frame_data in sorted(all_frames.items()):
-            if video_idx not in idx_to_frame:
-                continue
-
-            blender_frame = idx_to_frame[video_idx]
-            masks = frame_data["masks"]
-
-            if not masks:
-                continue
-
-            combined = np.zeros_like(masks[0], dtype=np.uint8)
-            for m in masks:
-                combined = np.maximum(combined, m.astype(np.uint8) * 255)
-
-            if blur_radius > 0:
-                pil_mask = PIL.Image.fromarray(combined).convert('RGBA')
-                pil_mask = pil_mask.filter(PIL.ImageFilter.BoxBlur(radius=blur_radius))
-            else:
-                pil_mask = PIL.Image.fromarray(combined).convert('RGBA')
-
-            img_seq_dir = os.path.join(get_rotoforge_dir('masksequences'), used_mask)
-            if not os.path.isdir(img_seq_dir):
-                os.makedirs(img_seq_dir)
-
-            frame_str = str(blender_frame).zfill(padding)
-            flipped = pil_mask.transpose(PIL.Image.FLIP_TOP_BOTTOM)
-            flipped.save(os.path.join(img_seq_dir, f"{frame_str}.png"))
-            saved += 1
-
-            if progress_callback:
-                progress_callback(saved, total)
-
-        print(f'Saved {saved} tracked frames')
-        return saved
-
-    finally:
-        client.video_close_session(session_id)
-        if os.path.isdir(local_frames_dir):
-            shutil.rmtree(local_frames_dir)
+    return server_track_video_points(
+        client=client,
+        local_frames_dir=local_frames_dir,
+        frame_to_idx=frame_to_idx,
+        used_mask=used_mask,
+        image_size=tuple(source_image.size),
+        frame_start=frame_start,
+        frame_end=frame_end,
+        prompt_frame=prompt_frame,
+        input_points=input_points,
+        input_labels=input_labels,
+        blur_radius=blur_radius,
+        direction=direction,
+        scene_frame_end=bpy.context.scene.frame_end,
+    )

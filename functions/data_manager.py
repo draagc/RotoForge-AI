@@ -334,6 +334,14 @@ class MaskGenControls(bpy.types.PropertyGroup):
         ],
         default = 'union'
     ) # type: ignore
+
+    fill_hole_area : bpy.props.IntProperty(
+        name = "Fill Holes",
+        description = "Fill small holes in masks up to this pixel area (0 = disabled). Higher values fill larger gaps in fine details like hair",
+        default = 16,
+        min = 0,
+        soft_max = 200,
+    ) # type: ignore
     
     @classmethod 
     def register(cls):
