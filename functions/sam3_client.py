@@ -366,7 +366,10 @@ class SAM3Client:
         results = {}
         try:
             with urllib.request.urlopen(req, timeout=600) as resp:
-                for raw_line in resp:
+                while True:
+                    raw_line = resp.readline()
+                    if not raw_line:
+                        break
                     line = raw_line.strip()
                     if not line:
                         continue

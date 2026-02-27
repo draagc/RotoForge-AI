@@ -315,7 +315,11 @@ def track_mask_text(
 # Video tracking — SAM3 native temporal tracking
 # ---------------------------------------------------------------------------
 
-def export_frames_to_jpeg(source_image, frame_start, frame_end):
+MODEL_RESOLUTION = 1008
+
+
+def export_frames_to_jpeg(source_image, frame_start, frame_end,
+                          progress_callback=None):
     """Export Blender image sequence frames to a temp JPEG directory.
 
     Must be called from the main thread (accesses bpy.context).
@@ -323,8 +327,17 @@ def export_frames_to_jpeg(source_image, frame_start, frame_end):
     writes them to a temp image whose colorspace matches the source, and
     calls save_render() so the full color management pipeline is applied.
 
-    Returns the path to the directory and the frame-to-index mapping.
-    The video predictor expects JPEG files named 00000.jpg, 00001.jpg, etc.
+    If the source is larger than MODEL_RESOLUTION, frames are downsampled
+    with Lanczos to give the model cleaner input than its internal bilinear
+    resize would produce.
+
+    Args:
+        progress_callback: optional callable(current, total) called after
+            each frame so the caller can update the UI.
+
+    Returns (frames_dir, frame_to_idx, original_size):
+        original_size is (width, height) of the source, needed to upscale
+        masks back after propagation.
     """
     frames_dir = os.path.join(get_rotoforge_dir(), "video_frames_tmp")
     if os.path.isdir(frames_dir):
@@ -346,8 +359,15 @@ def export_frames_to_jpeg(source_image, frame_start, frame_end):
     img_settings.quality = 95
 
     w, h = source_image.size
+    original_size = (w, h)
     n_pixels = w * h * 4
     buf = np.zeros(n_pixels, dtype=np.float32)
+
+    need_resize = max(w, h) > MODEL_RESOLUTION
+    if need_resize:
+        scale = MODEL_RESOLUTION / max(w, h)
+        new_w = round(w * scale)
+        new_h = round(h * scale)
 
     tmp_img = bpy.data.images.new(
         "_rf_export_tmp", w, h, alpha=True, float_buffer=True,
@@ -356,6 +376,7 @@ def export_frames_to_jpeg(source_image, frame_start, frame_end):
 
     frame_to_idx = {}
     idx = 0
+    total = frame_end - frame_start + 1
 
     try:
         iu = space.image_user
@@ -367,13 +388,19 @@ def export_frames_to_jpeg(source_image, frame_start, frame_end):
             source_image.pixels.foreach_get(buf)
             tmp_img.pixels.foreach_set(buf)
 
-            filename = f"{idx:05d}.jpg"
-            tmp_img.save_render(
-                filepath=os.path.join(frames_dir, filename),
-                scene=scene,
-            )
+            filepath = os.path.join(frames_dir, f"{idx:05d}.jpg")
+            tmp_img.save_render(filepath=filepath, scene=scene)
+
+            if need_resize:
+                pil_img = PIL.Image.open(filepath)
+                pil_img = pil_img.resize((new_w, new_h), PIL.Image.LANCZOS)
+                pil_img.save(filepath, quality=95)
+
             frame_to_idx[frame_num] = idx
             idx += 1
+
+            if progress_callback:
+                progress_callback(idx, total)
     finally:
         bpy.data.images.remove(tmp_img, do_unlink=True)
         img_settings.file_format = orig_format
@@ -381,8 +408,11 @@ def export_frames_to_jpeg(source_image, frame_start, frame_end):
         img_settings.quality = orig_quality
         scene.frame_current = original_frame
 
-    print(f'Exported {idx} frames to {frames_dir}')
-    return frames_dir, frame_to_idx
+    if need_resize:
+        print(f'Exported {idx} frames to {frames_dir} (resized {w}x{h} → {new_w}x{new_h})')
+    else:
+        print(f'Exported {idx} frames to {frames_dir}')
+    return frames_dir, frame_to_idx, original_size
 
 
 def _idx_to_frame(frame_to_idx):
@@ -393,9 +423,16 @@ def _idx_to_frame(frame_to_idx):
 def _save_propagated_masks(
     all_frames, idx_to_frame, used_mask,
     frame_end, scene_frame_end, blur_radius,
+    original_size=None,
     status_callback=None,
 ):
-    """Save propagated masks to disk — thread-safe (no bpy access)."""
+    """Save propagated masks to disk — thread-safe (no bpy access).
+
+    Args:
+        original_size: (width, height) of the source footage. If the masks
+            are smaller (due to pre-downsampling), they are upscaled back
+            with nearest-neighbor to keep sharp edges.
+    """
     saved = 0
     total = len(all_frames)
     max_frame = max(frame_end, scene_frame_end)
@@ -415,11 +452,16 @@ def _save_propagated_masks(
         for m in masks:
             combined = np.maximum(combined, m.astype(np.uint8) * 255)
 
+        pil_mask = PIL.Image.fromarray(combined)
+
+        if original_size and pil_mask.size != original_size:
+            pil_mask = pil_mask.resize(original_size, PIL.Image.NEAREST)
+
         if blur_radius > 0:
-            pil_mask = PIL.Image.fromarray(combined).convert('RGBA')
+            pil_mask = pil_mask.convert('RGBA')
             pil_mask = pil_mask.filter(PIL.ImageFilter.BoxBlur(radius=blur_radius))
         else:
-            pil_mask = PIL.Image.fromarray(combined).convert('RGBA')
+            pil_mask = pil_mask.convert('RGBA')
 
         img_seq_dir = os.path.join(get_rotoforge_dir('masksequences'), used_mask)
         if not os.path.isdir(img_seq_dir):
@@ -443,6 +485,7 @@ def server_track_video_text(
     blur_radius=0.2, confidence_threshold=0.5,
     direction="both", scene_frame_end=0,
     fill_hole_area=16,
+    original_size=None,
     status_callback=None,
 ):
     """Server-side video text tracking — thread-safe (no bpy access).
@@ -503,6 +546,7 @@ def server_track_video_text(
         return _save_propagated_masks(
             all_frames, idx_to_frame, used_mask,
             frame_end, scene_frame_end, blur_radius,
+            original_size=original_size,
             status_callback=status_callback,
         )
 
@@ -527,7 +571,7 @@ def track_video_text(
 ):
     """Convenience wrapper — exports frames then tracks. Blocks the caller."""
     print(f'Exporting frames {frame_start}-{frame_end}...')
-    local_frames_dir, frame_to_idx = export_frames_to_jpeg(
+    local_frames_dir, frame_to_idx, original_size = export_frames_to_jpeg(
         source_image, frame_start, frame_end
     )
     return server_track_video_text(
@@ -543,6 +587,7 @@ def track_video_text(
         confidence_threshold=confidence_threshold,
         direction=direction,
         scene_frame_end=bpy.context.scene.frame_end,
+        original_size=original_size,
     )
 
 
@@ -553,6 +598,7 @@ def server_track_video_points(
     input_points=None, input_labels=None,
     blur_radius=0.2, direction="both",
     scene_frame_end=0, fill_hole_area=16,
+    original_size=None,
     status_callback=None,
 ):
     """Server-side video point tracking — thread-safe (no bpy access).
@@ -620,6 +666,7 @@ def server_track_video_points(
         return _save_propagated_masks(
             all_frames, idx_to_frame, used_mask,
             frame_end, scene_frame_end, blur_radius,
+            original_size=original_size,
             status_callback=status_callback,
         )
 
@@ -644,7 +691,7 @@ def track_video_points(
 ):
     """Convenience wrapper — exports frames then tracks. Blocks the caller."""
     print(f'Exporting frames {frame_start}-{frame_end}...')
-    local_frames_dir, frame_to_idx = export_frames_to_jpeg(
+    local_frames_dir, frame_to_idx, original_size = export_frames_to_jpeg(
         source_image, frame_start, frame_end
     )
     return server_track_video_points(
@@ -661,4 +708,5 @@ def track_video_points(
         blur_radius=blur_radius,
         direction=direction,
         scene_frame_end=bpy.context.scene.frame_end,
+        original_size=original_size,
     )

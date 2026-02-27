@@ -665,10 +665,17 @@ class TrackVideoTextOperator(bpy.types.Operator):
         _tracking_busy = True
         _tracking_status = "Exporting frames..."
         self._status = _tracking_status
-        context.area.header_text_set(f"RotoForge: {self._status}")
 
-        local_frames_dir, frame_to_idx = generate_masks.export_frames_to_jpeg(
-            image, mask.frame_start, mask.frame_end
+        def _export_progress(current, total):
+            global _tracking_status
+            msg = f"Exporting frames {current}/{total}..."
+            self._status = msg
+            _tracking_status = msg
+            bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
+
+        local_frames_dir, frame_to_idx, original_size = generate_masks.export_frames_to_jpeg(
+            image, mask.frame_start, mask.frame_end,
+            progress_callback=_export_progress,
         )
 
         scene_frame_end = context.scene.frame_end
@@ -702,6 +709,7 @@ class TrackVideoTextOperator(bpy.types.Operator):
                     direction="both",
                     scene_frame_end=scene_frame_end,
                     fill_hole_area=fill_hole_area,
+                    original_size=original_size,
                     status_callback=_status_cb,
                 )
             except Exception as e:
@@ -719,7 +727,8 @@ class TrackVideoTextOperator(bpy.types.Operator):
     def _finish(self, context):
         global _tracking_busy, _tracking_status
         context.window_manager.event_timer_remove(self._timer)
-        context.area.header_text_set(None)
+        if context.area:
+            context.area.header_text_set(None)
         _tracking_busy = False
         _tracking_status = ""
 
@@ -733,8 +742,9 @@ class TrackVideoTextOperator(bpy.types.Operator):
             return {'PASS_THROUGH'}
 
         if self._thread.is_alive():
-            context.area.header_text_set(f"RotoForge: {self._status}")
-            context.area.tag_redraw()
+            if context.area:
+                context.area.header_text_set(f"RotoForge: {self._status}")
+                context.area.tag_redraw()
             return {'PASS_THROUGH'}
 
         self._finish(context)
@@ -809,10 +819,17 @@ class TrackVideoPointsOperator(bpy.types.Operator):
         _tracking_busy = True
         _tracking_status = "Exporting frames..."
         self._status = _tracking_status
-        context.area.header_text_set(f"RotoForge: {self._status}")
 
-        local_frames_dir, frame_to_idx = generate_masks.export_frames_to_jpeg(
-            image, mask.frame_start, mask.frame_end
+        def _export_progress(current, total):
+            global _tracking_status
+            msg = f"Exporting frames {current}/{total}..."
+            self._status = msg
+            _tracking_status = msg
+            bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
+
+        local_frames_dir, frame_to_idx, original_size = generate_masks.export_frames_to_jpeg(
+            image, mask.frame_start, mask.frame_end,
+            progress_callback=_export_progress,
         )
 
         scene_frame_end = context.scene.frame_end
@@ -846,6 +863,7 @@ class TrackVideoPointsOperator(bpy.types.Operator):
                     direction="both",
                     scene_frame_end=scene_frame_end,
                     fill_hole_area=fill_hole_area,
+                    original_size=original_size,
                     status_callback=_status_cb,
                 )
             except Exception as e:
@@ -863,7 +881,8 @@ class TrackVideoPointsOperator(bpy.types.Operator):
     def _finish(self, context):
         global _tracking_busy, _tracking_status
         context.window_manager.event_timer_remove(self._timer)
-        context.area.header_text_set(None)
+        if context.area:
+            context.area.header_text_set(None)
         _tracking_busy = False
         _tracking_status = ""
 
@@ -877,8 +896,9 @@ class TrackVideoPointsOperator(bpy.types.Operator):
             return {'PASS_THROUGH'}
 
         if self._thread.is_alive():
-            context.area.header_text_set(f"RotoForge: {self._status}")
-            context.area.tag_redraw()
+            if context.area:
+                context.area.header_text_set(f"RotoForge: {self._status}")
+                context.area.tag_redraw()
             return {'PASS_THROUGH'}
 
         self._finish(context)
