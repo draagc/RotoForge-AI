@@ -1,8 +1,36 @@
 import bpy
+import json
 import os
 from .functions import install_dependencies
 
 deps_check = None
+
+_SETTINGS_PATH = os.path.join(os.path.expanduser("~"), ".rotoforge_ai.json")
+_PERSISTED_KEYS = ("server_mode", "server_host", "server_port", "dependencies_path")
+
+
+def _load_settings(prefs):
+    """Restore persisted settings from disk into addon preferences."""
+    if not os.path.isfile(_SETTINGS_PATH):
+        return
+    try:
+        with open(_SETTINGS_PATH, "r") as f:
+            data = json.load(f)
+        for key in _PERSISTED_KEYS:
+            if key in data:
+                setattr(prefs, key, data[key])
+    except Exception as e:
+        print(f"RotoForge AI: Could not load settings: {e}")
+
+
+def _save_settings(prefs):
+    """Persist current addon preferences to disk."""
+    data = {key: getattr(prefs, key) for key in _PERSISTED_KEYS}
+    try:
+        with open(_SETTINGS_PATH, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"RotoForge AI: Could not save settings: {e}")
 
 
 class Install_Dependencies_Operator(bpy.types.Operator):
@@ -58,6 +86,26 @@ class Test_Dependencies_Operator(bpy.types.Operator):
 
         context.window_manager.popup_menu(title='Dependencies Debug Info', draw_func=draw)
         return {'FINISHED'}
+
+
+class Install_Blender_Packages_Operator(bpy.types.Operator):
+    """Install only the lightweight Blender-side packages (numpy, Pillow)"""
+    bl_idname = "rotoforge.install_blender_packages"
+    bl_label = "Install Blender packages"
+    bl_description = "Install numpy and Pillow for Blender (needed for mask I/O)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        ok = install_dependencies.install_blender_packages()
+        if ok:
+            self.report({'INFO'}, 'Blender packages installed — please restart Blender')
+        else:
+            self.report({'ERROR'}, 'Installation failed — check the system console')
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        wm = context.window_manager
+        return wm.invoke_confirm(self, event)
 
 
 class Forceupdate_Dependencies_Operator(bpy.types.Operator):
@@ -131,6 +179,18 @@ class RotoForge_Preferences(bpy.types.AddonPreferences):
             row.prop(self, "server_host")
             row.prop(self, "server_port")
             box.label(text="Run sam3_server.py on the remote machine, then enter its IP here.")
+
+            layout.separator()
+            layout.prop(self, "dependencies_path")
+            try:
+                blender_ok = install_dependencies.test_blender_packages()
+            except Exception:
+                blender_ok = False
+            if blender_ok:
+                layout.label(text="Blender packages (numpy, Pillow) are installed.")
+            else:
+                layout.label(text="Blender packages (numpy, Pillow) need to be installed:")
+                layout.operator("rotoforge.install_blender_packages")
             return
 
         # Local mode — show install path and dependency management
@@ -163,6 +223,7 @@ class RotoForge_Preferences(bpy.types.AddonPreferences):
 classes = [
     RotoForge_Preferences,
     Install_Dependencies_Operator,
+    Install_Blender_Packages_Operator,
     Forceupdate_Dependencies_Operator,
     Test_Dependencies_Operator,
 ]
