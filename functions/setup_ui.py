@@ -673,8 +673,12 @@ class TrackVideoTextOperator(bpy.types.Operator):
             _tracking_status = msg
             bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
 
+        pre_downsample = props.pre_downsample
+        input_sharpening = props.input_sharpening
         local_frames_dir, frame_to_idx, original_size = generate_masks.export_frames_to_jpeg(
             image, mask.frame_start, mask.frame_end,
+            pre_downsample=pre_downsample,
+            input_sharpening=input_sharpening,
             progress_callback=_export_progress,
         )
 
@@ -684,6 +688,7 @@ class TrackVideoTextOperator(bpy.types.Operator):
         blur_radius = props.feather_radius
         confidence_threshold = props.text_confidence
         fill_hole_area = props.fill_hole_area
+        mask_threshold = props.mask_threshold
         frame_start = mask.frame_start
         frame_end = mask.frame_end
         used_mask = self._used_mask
@@ -709,7 +714,8 @@ class TrackVideoTextOperator(bpy.types.Operator):
                     direction="both",
                     scene_frame_end=scene_frame_end,
                     fill_hole_area=fill_hole_area,
-                    original_size=original_size,
+                    mask_threshold=mask_threshold,
+                    original_size=original_size if pre_downsample else None,
                     status_callback=_status_cb,
                 )
             except Exception as e:
@@ -827,8 +833,12 @@ class TrackVideoPointsOperator(bpy.types.Operator):
             _tracking_status = msg
             bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
 
+        pre_downsample = props.pre_downsample
+        input_sharpening = props.input_sharpening
         local_frames_dir, frame_to_idx, original_size = generate_masks.export_frames_to_jpeg(
             image, mask.frame_start, mask.frame_end,
+            pre_downsample=pre_downsample,
+            input_sharpening=input_sharpening,
             progress_callback=_export_progress,
         )
 
@@ -836,6 +846,7 @@ class TrackVideoPointsOperator(bpy.types.Operator):
         prompt_frame = context.scene.frame_current
         blur_radius = props.feather_radius
         fill_hole_area = props.fill_hole_area
+        mask_threshold = props.mask_threshold
         frame_start = mask.frame_start
         frame_end = mask.frame_end
         image_size = resolution
@@ -863,7 +874,8 @@ class TrackVideoPointsOperator(bpy.types.Operator):
                     direction="both",
                     scene_frame_end=scene_frame_end,
                     fill_hole_area=fill_hole_area,
-                    original_size=original_size,
+                    mask_threshold=mask_threshold,
+                    original_size=original_size if pre_downsample else None,
                     status_callback=_status_cb,
                 )
             except Exception as e:
@@ -1193,6 +1205,9 @@ class RotoForgeMaskPanel(bpy.types.Panel):
         settings_box.label(text="Mask Settings")
         settings_box.prop(props, "feather_radius")
         settings_box.prop(props, "fill_hole_area")
+        settings_box.prop(props, "mask_threshold")
+        settings_box.prop(props, "input_sharpening")
+        settings_box.prop(props, "pre_downsample")
         layout.separator()
 
         # Text Prompt

@@ -137,11 +137,45 @@ def load_model():
     print("[sam3_server] Model loaded (text + interactive point prompting)")
 
 
+def _patch_mask_threshold():
+    """Monkey-patch SAM3's build_outputs to use a configurable mask_threshold
+    instead of the hardcoded ``> 0`` binarization."""
+    try:
+        import sam3.model.sam3_video_base as _vb
+        import inspect
+        import textwrap
+
+        for attr_name in dir(_vb):
+            cls = getattr(_vb, attr_name)
+            if not isinstance(cls, type) or 'build_outputs' not in cls.__dict__:
+                continue
+
+            orig = cls.build_outputs
+            src = textwrap.dedent(inspect.getsource(orig))
+
+            if '> 0' not in src:
+                continue
+
+            new_src = src.replace('> 0', '> getattr(self, "mask_threshold", 0.0)')
+            ns = {**vars(_vb)}
+            exec(compile(new_src, inspect.getfile(orig), 'exec'), ns)
+            cls.build_outputs = ns['build_outputs']
+
+            print(f"[sam3_server] Patched {cls.__name__}.build_outputs for configurable mask_threshold")
+            return
+
+        print("[sam3_server] WARNING: no build_outputs with '> 0' found — threshold patch skipped")
+    except Exception as e:
+        print(f"[sam3_server] WARNING: could not patch build_outputs: {e}")
+
+
 def load_video_predictor():
     """Load the SAM3 video predictor for temporal tracking."""
     global _video_predictor, _device, _device_name
 
     from sam3.model_builder import build_sam3_video_predictor
+
+    _patch_mask_threshold()
 
     if _device is None:
         _device, _device_name = get_device()
@@ -329,16 +363,19 @@ def video_add_prompt(session_id: str, frame_index: int,
     }
 
 
-def video_propagate(session_id: str, direction="both", fill_hole_area=16):
+def video_propagate(session_id: str, direction="both", fill_hole_area=16,
+                    mask_threshold=0.0):
     """Propagate tracking across all frames. Returns a dict of frame_index → masks.
 
     Args:
         session_id: active session
         direction: "forward", "backward", or "both"
         fill_hole_area: pixel area threshold for hole filling (0 = disabled)
+        mask_threshold: logit threshold for binarization (0.0 = model default)
     """
     if _video_predictor is not None and hasattr(_video_predictor, 'model'):
         _video_predictor.model.fill_hole_area = fill_hole_area
+        _video_predictor.model.mask_threshold = mask_threshold
 
     results = {}
 
@@ -625,6 +662,7 @@ class SAM3Handler(BaseHTTPRequestHandler):
         data = self._read_json()
         direction = data.get("direction", "both")
         fill_hole_area = data.get("fill_hole_area", 16)
+        mask_threshold = data.get("mask_threshold", 0.0)
         session_id = data["session_id"]
 
         self._start_ndjson()
@@ -632,6 +670,7 @@ class SAM3Handler(BaseHTTPRequestHandler):
         with _lock:
             if _video_predictor is not None and hasattr(_video_predictor, 'model'):
                 _video_predictor.model.fill_hole_area = fill_hole_area
+                _video_predictor.model.mask_threshold = mask_threshold
 
             count = 0
             for frame_result in _video_predictor.handle_stream_request(dict(

@@ -357,6 +357,35 @@ class MaskGenControls(bpy.types.PropertyGroup):
         min = 0,
         soft_max = 200,
     ) # type: ignore
+
+    pre_downsample : bpy.props.BoolProperty(
+        name = "Pre-downsample",
+        description = "Downsample frames to model resolution (1008px) with Lanczos before inference. Faster upload but slightly less precise edges since the model's internal logit-to-mask upscaling is bypassed",
+        default = False,
+    ) # type: ignore
+
+    mask_threshold : bpy.props.FloatProperty(
+        name = "Mask Threshold",
+        description = "Binarization threshold for mask logits. Lower values include more uncertain boundary pixels (e.g. hair edges). 0.0 = model default",
+        default = 0.0,
+        min = -5.0,
+        max = 5.0,
+        soft_min = -3.0,
+        soft_max = 1.0,
+        step = 10,
+        precision = 1,
+    ) # type: ignore
+
+    input_sharpening : bpy.props.FloatProperty(
+        name = "Input Sharpening",
+        description = "Sharpen input frames before inference to emphasize fine detail (unsharp mask strength). 0 = disabled",
+        default = 0.0,
+        min = 0.0,
+        max = 300.0,
+        soft_max = 200.0,
+        step = 100,
+        precision = 0,
+    ) # type: ignore
     
     @classmethod 
     def register(cls):

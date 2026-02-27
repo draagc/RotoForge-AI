@@ -319,6 +319,7 @@ MODEL_RESOLUTION = 1008
 
 
 def export_frames_to_jpeg(source_image, frame_start, frame_end,
+                          pre_downsample=True, input_sharpening=0.0,
                           progress_callback=None):
     """Export Blender image sequence frames to a temp JPEG directory.
 
@@ -363,7 +364,7 @@ def export_frames_to_jpeg(source_image, frame_start, frame_end,
     n_pixels = w * h * 4
     buf = np.zeros(n_pixels, dtype=np.float32)
 
-    need_resize = max(w, h) > MODEL_RESOLUTION
+    need_resize = pre_downsample and max(w, h) > MODEL_RESOLUTION
     if need_resize:
         scale = MODEL_RESOLUTION / max(w, h)
         new_w = round(w * scale)
@@ -391,9 +392,16 @@ def export_frames_to_jpeg(source_image, frame_start, frame_end,
             filepath = os.path.join(frames_dir, f"{idx:05d}.jpg")
             tmp_img.save_render(filepath=filepath, scene=scene)
 
-            if need_resize:
+            if need_resize or input_sharpening > 0:
                 pil_img = PIL.Image.open(filepath)
-                pil_img = pil_img.resize((new_w, new_h), PIL.Image.LANCZOS)
+                if need_resize:
+                    pil_img = pil_img.resize((new_w, new_h), PIL.Image.LANCZOS)
+                if input_sharpening > 0:
+                    pil_img = pil_img.filter(
+                        PIL.ImageFilter.UnsharpMask(
+                            radius=1, percent=int(input_sharpening), threshold=0,
+                        )
+                    )
                 pil_img.save(filepath, quality=95)
 
             frame_to_idx[frame_num] = idx
@@ -455,11 +463,14 @@ def _save_propagated_masks(
         pil_mask = PIL.Image.fromarray(combined)
 
         if original_size and pil_mask.size != original_size:
-            pil_mask = pil_mask.resize(original_size, PIL.Image.NEAREST)
+            # Anti-alias the binary mask edges before upscaling —
+            # 1px blur at model resolution prevents staircase artifacts at 4K
+            pil_mask = pil_mask.filter(PIL.ImageFilter.GaussianBlur(radius=1))
+            pil_mask = pil_mask.resize(original_size, PIL.Image.BICUBIC)
 
         if blur_radius > 0:
             pil_mask = pil_mask.convert('RGBA')
-            pil_mask = pil_mask.filter(PIL.ImageFilter.BoxBlur(radius=blur_radius))
+            pil_mask = pil_mask.filter(PIL.ImageFilter.GaussianBlur(radius=blur_radius))
         else:
             pil_mask = pil_mask.convert('RGBA')
 
@@ -484,7 +495,7 @@ def server_track_video_text(
     frame_start, frame_end, prompt_frame,
     blur_radius=0.2, confidence_threshold=0.5,
     direction="both", scene_frame_end=0,
-    fill_hole_area=16,
+    fill_hole_area=16, mask_threshold=0.0,
     original_size=None,
     status_callback=None,
 ):
@@ -541,6 +552,7 @@ def server_track_video_text(
 
         all_frames = client.video_propagate(session_id, direction=direction,
                                             fill_hole_area=fill_hole_area,
+                                            mask_threshold=mask_threshold,
                                             progress_callback=_prop_progress)
 
         return _save_propagated_masks(
@@ -598,6 +610,7 @@ def server_track_video_points(
     input_points=None, input_labels=None,
     blur_radius=0.2, direction="both",
     scene_frame_end=0, fill_hole_area=16,
+    mask_threshold=0.0,
     original_size=None,
     status_callback=None,
 ):
@@ -661,6 +674,7 @@ def server_track_video_points(
 
         all_frames = client.video_propagate(session_id, direction=direction,
                                             fill_hole_area=fill_hole_area,
+                                            mask_threshold=mask_threshold,
                                             progress_callback=_prop_progress)
 
         return _save_propagated_masks(

@@ -340,13 +340,15 @@ class SAM3Client:
         }
 
     def video_propagate(self, session_id: str, direction="both",
-                        fill_hole_area=16, progress_callback=None):
+                        fill_hole_area=16, mask_threshold=0.0,
+                        progress_callback=None):
         """Propagate tracking across all video frames.
 
         Args:
             session_id: active session.
             direction: "forward", "backward", or "both".
             fill_hole_area: pixel area threshold for hole filling (0 = disabled).
+            mask_threshold: logit threshold for binarization (0.0 = model default).
             progress_callback: optional callable(frames_done: int) called as
                 each frame result arrives from the server stream.
 
@@ -358,6 +360,7 @@ class SAM3Client:
             "session_id": session_id,
             "direction": direction,
             "fill_hole_area": fill_hole_area,
+            "mask_threshold": mask_threshold,
         }).encode("utf-8")
         headers = {"Content-Type": "application/json"}
         req = urllib.request.Request(url, data=payload, headers=headers,
